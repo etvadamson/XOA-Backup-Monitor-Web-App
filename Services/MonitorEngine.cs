@@ -119,6 +119,24 @@ namespace XOABackupMonitorWeb.Services
             await _cacheService.SaveCacheAsync(snapshot);
         }
 
+        /// <summary>
+        /// Immediately strips all cached VM/backup entries for an instance from both
+        /// in-memory state and the on-disk cache. Called right after an instance is
+        /// deleted from config so the dashboard reflects the removal instantly instead
+        /// of waiting for the next full "Refresh Now" or background refresh cycle.
+        /// </summary>
+        public async Task RemoveInstanceAsync(string instanceName)
+        {
+            List<VMBackupStatus> snapshot;
+            lock (_stateLock)
+            {
+                _currentBackups.RemoveAll(b => b.InstanceName == instanceName);
+                snapshot = new List<VMBackupStatus>(_currentBackups);
+            }
+
+            await _cacheService.SaveCacheAsync(snapshot);
+        }
+
         private async Task<List<VMBackupStatus>> RefreshSingleInstanceInternalAsync(
             XOAInstance instance, CancellationToken ct)
         {

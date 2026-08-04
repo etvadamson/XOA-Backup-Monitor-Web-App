@@ -148,6 +148,7 @@ async function loadInstances() {
       const name = e.currentTarget.getAttribute('data-delete');
       await fetch(`/api/instances/${encodeURIComponent(name)}`, { method: 'DELETE' });
       await loadInstances();
+      await fetchStatus();
     });
   });
 }
@@ -161,6 +162,10 @@ instanceForm.addEventListener('submit', async (e) => {
     isEnabled: document.getElementById('instanceEnabled').checked
   };
 
+  const saveBtn = e.target.querySelector('button[type="submit"]');
+  const originalText = saveBtn ? saveBtn.textContent : '';
+  if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving...'; }
+
   await fetch('/api/instances', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -169,11 +174,14 @@ instanceForm.addEventListener('submit', async (e) => {
 
   document.getElementById('instanceToken').value = '';
   await loadInstances();
+
+  if (saveBtn) { saveBtn.textContent = 'Refreshing data...'; }
+  await fetch(`/api/refresh/${encodeURIComponent(body.name)}`, { method: 'POST' });
+  await fetchStatus();
+
+  if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = originalText; }
 });
 
-// Tests the URL/token currently typed in the form directly - no save required first.
-// This fixes the "Test always fails" issue: previously this looked up a SAVED instance
-// by name, so testing before clicking "Save Instance" always returned 404.
 document.getElementById('testConnectionBtn').addEventListener('click', async () => {
   const url = document.getElementById('instanceUrl').value;
   const token = document.getElementById('instanceToken').value;
