@@ -171,14 +171,26 @@ instanceForm.addEventListener('submit', async (e) => {
   await loadInstances();
 });
 
+// Tests the URL/token currently typed in the form directly - no save required first.
+// This fixes the "Test always fails" issue: previously this looked up a SAVED instance
+// by name, so testing before clicking "Save Instance" always returned 404.
 document.getElementById('testConnectionBtn').addEventListener('click', async () => {
-  const name = document.getElementById('instanceName').value;
-  if (!name) {
-    testResult.textContent = 'Save the instance first, then test.';
+  const url = document.getElementById('instanceUrl').value;
+  const token = document.getElementById('instanceToken').value;
+
+  if (!url || !token) {
+    testResult.textContent = 'Enter URL and API Token first, then Test.';
+    testResult.style.color = '#f39c12';
     return;
   }
+
   testResult.textContent = 'Testing...';
-  const res = await fetch(`/api/instances/${encodeURIComponent(name)}/test`, { method: 'POST' });
+  testResult.style.color = '';
+  const res = await fetch('/api/test-connection', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, apiToken: token })
+  });
   const data = await res.json();
   testResult.textContent = data.success ? 'Connection OK' : 'Connection failed';
   testResult.style.color = data.success ? '#2ecc71' : '#e74c3c';

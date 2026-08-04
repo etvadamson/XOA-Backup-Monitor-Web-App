@@ -17,15 +17,22 @@ app.UseStaticFiles();
 
 app.MapGet("/api/status", (MonitorEngine engine) => Results.Ok(engine.GetStatusSnapshot()));
 
-app.MapPost("/api/refresh", async (MonitorEngine engine, CancellationToken ct) =>
+// Refresh endpoints intentionally use CancellationToken.None instead of the request's
+// token (HttpContext.RequestAborted). If we used the request token, a browser tab close,
+// navigation, or double-click of "Refresh Now" would cancel the in-flight HTTP calls to
+// the XOA host mid-fetch (visible as TaskCanceledException / SocketException(995) in logs),
+// leaving that instance's status stuck on an error until the next background cycle.
+// Using None guarantees the refresh always runs to completion and updates shared state,
+// regardless of what the calling browser does.
+app.MapPost("/api/refresh", async (MonitorEngine engine) =>
 {
-    await engine.RefreshAllAsync(ct);
+    await engine.RefreshAllAsync(CancellationToken.None);
     return Results.Ok(engine.GetStatusSnapshot());
 });
 
-app.MapPost("/api/refresh/{instanceName}", async (string instanceName, MonitorEngine engine, CancellationToken ct) =>
+app.MapPost("/api/refresh/{instanceName}", async (string instanceName, MonitorEngine engine) =>
 {
-    await engine.RefreshInstanceAsync(instanceName, ct);
+    await engine.RefreshInstanceAsync(instanceName, CancellationToken.None);
     return Results.Ok(engine.GetStatusSnapshot());
 });
 
@@ -57,6 +64,7 @@ app.MapDelete("/api/instances/{name}", async (string name, ConfigService configS
     return Results.Ok(await configService.LoadInstanceSummariesAsync());
 });
 
+// Legacy endpoint: tests a SAVED instance by name. Kept for backward compatibility.
 app.MapPost("/api/instances/{name}/test", async (string name, ConfigService configService, XoaApiService apiService, CancellationToken ct) =>
 {
     var instances = await configService.LoadInstancesAsync();
@@ -67,6 +75,19 @@ app.MapPost("/api/instances/{name}/test", async (string name, ConfigService conf
     }
 
     var ok = await apiService.TestConnectionAsync(instance.Url, instance.ApiToken, ct);
+    return Results.Ok(new { success = ok });
+});
+
+// Tests a URL/token pair directly, without requiring the instance to be saved first.
+// This is what the "Test Connection" button in the Configure modal now uses.
+app.MapPost("/api/test-connection", async (TestConnectionRequest req, XoaApiService apiService) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Url) || string.IsNullOrWhiteSpace(req.ApiToken))
+    {
+        return Results.BadRequest(new { error = "Url and ApiToken are required." });
+    }
+
+    var ok = await apiService.TestConnectionAsync(req.Url, req.ApiToken, CancellationToken.None);
     return Results.Ok(new { success = ok });
 });
 
@@ -89,3 +110,4 @@ app.MapGet("/api/health", () => Results.Ok(new { status = "ok", time = DateTime.
 app.Run();
 
 record SettingsRequest(int RefreshIntervalMinutes);
+record TestConnectionRequest(string Url, string ApiToken);

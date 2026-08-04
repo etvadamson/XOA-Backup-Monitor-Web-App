@@ -9,6 +9,7 @@ namespace XOABackupMonitorWeb.Services
     {
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<XoaApiService> _logger;
+        private const int MaxConcurrency = 5;
 
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
@@ -29,25 +30,23 @@ namespace XOABackupMonitorWeb.Services
             try
             {
                 var vmUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/vms", ct);
-                var vms = new List<XoaVm>();
+                var vmResults = await MapWithConcurrencyAsync(vmUrls, MaxConcurrency,
+                    vmUrl => GetJsonAsync<XoaVm>(client, $"{baseUrl}{vmUrl}", ct));
 
-                foreach (var vmUrl in vmUrls)
-                {
-                    var vm = await GetJsonAsync<XoaVm>(client, $"{baseUrl}{vmUrl}", ct);
-                    if (vm != null && !vm.is_a_template && !vm.is_control_domain)
-                    {
-                        vms.Add(vm);
-                    }
-                }
-
-                vms = vms.GroupBy(v => v.uuid).Select(g => g.First()).ToList();
+                var vms = vmResults
+                    .Where(vm => vm != null && !vm.is_a_template && !vm.is_control_domain)
+                    .Select(vm => vm!)
+                    .GroupBy(v => v.uuid)
+                    .Select(g => g.First())
+                    .ToList();
 
                 var hostUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/hosts", ct);
-                var hosts = new Dictionary<string, string>();
+                var hostResults = await MapWithConcurrencyAsync(hostUrls, MaxConcurrency,
+                    hostUrl => GetJsonAsync<XoaHost>(client, $"{baseUrl}{hostUrl}", ct));
 
-                foreach (var hostUrl in hostUrls)
+                var hosts = new Dictionary<string, string>();
+                foreach (var host in hostResults)
                 {
-                    var host = await GetJsonAsync<XoaHost>(client, $"{baseUrl}{hostUrl}", ct);
                     if (host != null && !string.IsNullOrEmpty(host.uuid))
                     {
                         hosts[host.uuid] = host.name_label ?? "Unknown-Host";
@@ -58,16 +57,10 @@ namespace XOABackupMonitorWeb.Services
                     instanceName, hosts.Count, string.Join(", ", hosts.Values));
 
                 var logUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/backup-logs", ct);
-                var backupLogs = new List<XoaBackupLog>();
+                var logResults = await MapWithConcurrencyAsync(logUrls, MaxConcurrency,
+                    logUrl => GetJsonAsync<XoaBackupLog>(client, $"{baseUrl}{logUrl}", ct));
 
-                foreach (var logUrl in logUrls)
-                {
-                    var log = await GetJsonAsync<XoaBackupLog>(client, $"{baseUrl}{logUrl}", ct);
-                    if (log != null)
-                    {
-                        backupLogs.Add(log);
-                    }
-                }
+                var backupLogs = logResults.Where(l => l != null).Select(l => l!).ToList();
 
                 return GenerateBackupReport(vms, backupLogs, hosts, instanceName);
             }
@@ -103,6 +96,25 @@ namespace XOABackupMonitorWeb.Services
             client.DefaultRequestHeaders.Remove("Cookie");
             client.DefaultRequestHeaders.Add("Cookie", $"authenticationToken={apiToken}");
             return client;
+        }
+
+        private static async Task<List<TResult>> MapWithConcurrencyAsync<TSource, TResult>(
+            IEnumerable<TSource> source, int maxConcurrency, Func<TSource, Task<TResult>> selector)
+        {
+            using var semaphore = new SemaphoreSlim(maxConcurrency);
+            var tasks = source.Select(async item =>
+            {
+                await semaphore.WaitAsync();
+                try
+                {
+                    return await selector(item);
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            });
+            return (await Task.WhenAll(tasks)).ToList();
         }
 
         private static bool IsCanceled(XoaBackupTask task, out string cancelReason)
