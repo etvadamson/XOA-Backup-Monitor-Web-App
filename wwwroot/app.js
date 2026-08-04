@@ -68,7 +68,7 @@ function renderStatus(data) {
       const row = document.createElement('div');
       row.className = `vm-row status-${vm.status}`;
       row.innerHTML = `
-        <span>${escapeHtml(vm.vmName)}</span>
+        <span><a href="#" class="vm-link" data-instance="${escapeHtml(group.instanceName)}" data-vm="${escapeHtml(vm.vmName)}">${escapeHtml(vm.vmName)}</a></span>
         <span class="status-chip" style="background:${vm.statusColor}">${escapeHtml(vm.statusText)}</span>
         <span>${escapeHtml(vm.formattedLastBackup)}</span>
         <span>${typeof vm.ageInHours === 'number' ? vm.ageInHours.toFixed(1) : ''} hrs</span>
@@ -80,11 +80,20 @@ function renderStatus(data) {
     groupsEl.appendChild(card);
   }
 
-  document.querySelectorAll('[data-instance]').forEach(btn => {
+  document.querySelectorAll('[data-instance].icon-btn').forEach(btn => {
     btn.addEventListener('click', async (e) => {
       const name = e.currentTarget.getAttribute('data-instance');
       await fetch(`/api/refresh/${encodeURIComponent(name)}`, { method: 'POST' });
       fetchStatus();
+    });
+  });
+
+  document.querySelectorAll('.vm-link').forEach(link => {
+    link.addEventListener('click', (e) => {
+      e.preventDefault();
+      const instance = e.currentTarget.getAttribute('data-instance');
+      const vm = e.currentTarget.getAttribute('data-vm');
+      openHistoryModal(instance, vm);
     });
   });
 }
@@ -213,6 +222,83 @@ document.getElementById('testConnectionBtn').addEventListener('click', async () 
   const data = await res.json();
   testResult.textContent = data.success ? 'Connection OK' : 'Connection failed';
   testResult.style.color = data.success ? '#2ecc71' : '#e74c3c';
+});
+
+const historyModal = document.getElementById('historyModal');
+const historyTitle = document.getElementById('historyTitle');
+const historyTableBody = document.getElementById('historyTableBody');
+const historyStats = document.getElementById('historyStats');
+const historyRangeFilter = document.getElementById('historyRangeFilter');
+const historyStatusFilter = document.getElementById('historyStatusFilter');
+
+let currentHistoryEntries = [];
+
+async function openHistoryModal(instanceName, vmName) {
+  historyTitle.textContent = `Backup History - ${vmName}`;
+  historyTableBody.innerHTML = '<tr><td colspan="3">Loading...</td></tr>';
+  historyStats.textContent = '';
+  historyModal.classList.remove('hidden');
+
+  const res = await fetch(`/api/history?instance=${encodeURIComponent(instanceName)}&vm=${encodeURIComponent(vmName)}`);
+
+  if (!res.ok) {
+    historyTableBody.innerHTML = '<tr><td colspan="3">Failed to load history.</td></tr>';
+    return;
+  }
+
+  currentHistoryEntries = await res.json();
+  renderHistory();
+}
+
+function renderHistory() {
+  const rangeDays = parseInt(historyRangeFilter.value, 10);
+  const statusFilter = historyStatusFilter.value;
+
+  let filtered = currentHistoryEntries;
+
+  if (rangeDays > 0) {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - rangeDays);
+    filtered = filtered.filter(e => new Date(e.timestamp) >= cutoff);
+  }
+
+  if (statusFilter !== 'all') {
+    filtered = filtered.filter(e => e.status === statusFilter);
+  }
+
+  const total = filtered.length;
+  const success = filtered.filter(e => e.status === 'Success').length;
+  const warning = filtered.filter(e => e.status === 'Warning').length;
+  const failed = filtered.filter(e => e.status === 'Failed').length;
+  const successRate = total > 0 ? ((success / total) * 100).toFixed(1) : '0.0';
+
+  historyStats.innerHTML = `
+    <span>Total: <strong>${total}</strong></span>
+    <span style="color:#2ecc71">Success: <strong>${success}</strong></span>
+    <span style="color:#f39c12">Warning: <strong>${warning}</strong></span>
+    <span style="color:#e74c3c">Failed: <strong>${failed}</strong></span>
+    <span>Success Rate: <strong>${successRate}%</strong></span>
+  `;
+
+  if (filtered.length === 0) {
+    historyTableBody.innerHTML = '<tr><td colspan="3">No history entries for this filter.</td></tr>';
+    return;
+  }
+
+  historyTableBody.innerHTML = filtered.map(e => `
+    <tr>
+      <td>${new Date(e.timestamp).toLocaleString()}</td>
+      <td><span class="status-chip" style="background:${statusColors[e.status] || '#95a5a6'}">${escapeHtml(e.statusText)}</span></td>
+      <td>${escapeHtml(e.message)}</td>
+    </tr>
+  `).join('');
+}
+
+historyRangeFilter.addEventListener('change', renderHistory);
+historyStatusFilter.addEventListener('change', renderHistory);
+
+document.getElementById('closeHistoryBtn').addEventListener('click', () => {
+  historyModal.classList.add('hidden');
 });
 
 fetchStatus();

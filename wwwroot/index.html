@@ -73,6 +73,45 @@
     </div>
   </div>
 
+  <div id="historyModal" class="modal hidden">
+    <div class="modal-content history-modal-content">
+      <div class="modal-header">
+        <h2 id="historyTitle">VM Backup History</h2>
+        <button id="closeHistoryBtn" class="close-btn">&times;</button>
+      </div>
+
+      <div class="history-filters">
+        <label>Time Range
+          <select id="historyRangeFilter">
+            <option value="7">Last 7 Days</option>
+            <option value="30" selected>Last 30 Days</option>
+            <option value="90">Last 90 Days</option>
+            <option value="0">All Time</option>
+          </select>
+        </label>
+        <label>Status
+          <select id="historyStatusFilter">
+            <option value="all">All Statuses</option>
+            <option value="Success">Success Only</option>
+            <option value="Warning">Warnings Only</option>
+            <option value="Failed">Failures Only</option>
+          </select>
+        </label>
+      </div>
+
+      <div id="historyStats" class="history-stats"></div>
+
+      <div id="historyBody">
+        <table id="historyTable">
+          <thead>
+            <tr><th>Snapshot Time</th><th>Status</th><th>Message</th></tr>
+          </thead>
+          <tbody id="historyTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
 </body>
 </html>

@@ -29,38 +29,11 @@ namespace XOABackupMonitorWeb.Services
 
             try
             {
-                var vmUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/vms", ct);
-                var vmResults = await MapWithConcurrencyAsync(vmUrls, MaxConcurrency,
-                    vmUrl => GetJsonAsync<XoaVm>(client, $"{baseUrl}{vmUrl}", ct));
-
-                var vms = vmResults
-                    .Where(vm => vm != null && !vm.is_a_template && !vm.is_control_domain)
-                    .Select(vm => vm!)
-                    .GroupBy(v => v.uuid)
-                    .Select(g => g.First())
-                    .ToList();
-
-                var hostUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/hosts", ct);
-                var hostResults = await MapWithConcurrencyAsync(hostUrls, MaxConcurrency,
-                    hostUrl => GetJsonAsync<XoaHost>(client, $"{baseUrl}{hostUrl}", ct));
-
-                var hosts = new Dictionary<string, string>();
-                foreach (var host in hostResults)
-                {
-                    if (host != null && !string.IsNullOrEmpty(host.uuid))
-                    {
-                        hosts[host.uuid] = host.name_label ?? "Unknown-Host";
-                    }
-                }
+                var (vms, hosts) = await GetVmsAndHostsAsync(client, baseUrl, ct);
+                var backupLogs = await GetBackupLogsAsync(client, baseUrl, ct);
 
                 _logger.LogInformation("[{Instance}] Found {Count} hosts: {Hosts}",
                     instanceName, hosts.Count, string.Join(", ", hosts.Values));
-
-                var logUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/backup-logs", ct);
-                var logResults = await MapWithConcurrencyAsync(logUrls, MaxConcurrency,
-                    logUrl => GetJsonAsync<XoaBackupLog>(client, $"{baseUrl}{logUrl}", ct));
-
-                var backupLogs = logResults.Where(l => l != null).Select(l => l!).ToList();
 
                 return GenerateBackupReport(vms, backupLogs, hosts, instanceName);
             }
@@ -73,6 +46,59 @@ namespace XOABackupMonitorWeb.Services
                 throw new InvalidOperationException(
                     "Server returned HTML instead of JSON. Check if the URL is correct and the API is enabled.", ex);
             }
+        }
+
+        public async Task<List<VmHistoryEntry>> GetVmHistoryAsync(
+            string baseUrl, string apiToken, string vmFullName, CancellationToken ct = default)
+        {
+            var client = CreateClient(apiToken);
+
+            var (vms, hosts) = await GetVmsAndHostsAsync(client, baseUrl, ct);
+
+            XoaVm? targetVm = null;
+            foreach (var vm in vms)
+            {
+                if (BuildFullVmName(vm, hosts) == vmFullName)
+                {
+                    targetVm = vm;
+                    break;
+                }
+            }
+
+            if (targetVm == null || string.IsNullOrEmpty(targetVm.uuid))
+            {
+                return new List<VmHistoryEntry>();
+            }
+
+            var backupLogs = await GetBackupLogsAsync(client, baseUrl, ct);
+            var currentTime = DateTime.Now;
+            var entries = new List<VmHistoryEntry>();
+
+            foreach (var log in backupLogs)
+            {
+                var vmTask = log.tasks?.FirstOrDefault(t => t.data?.id == targetVm.uuid);
+                if (vmTask == null)
+                {
+                    continue;
+                }
+
+                var (status, statusText, messageDetail, _) = ClassifyTask(vmTask, log.jobName, currentTime);
+
+                if (statusText == "IN PROGRESS")
+                {
+                    continue;
+                }
+
+                entries.Add(new VmHistoryEntry
+                {
+                    Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(vmTask.start).LocalDateTime,
+                    Status = status,
+                    StatusText = statusText,
+                    Message = messageDetail
+                });
+            }
+
+            return entries.OrderByDescending(e => e.Timestamp).ToList();
         }
 
         public async Task<bool> TestConnectionAsync(string baseUrl, string apiToken, CancellationToken ct = default)
@@ -98,23 +124,53 @@ namespace XOABackupMonitorWeb.Services
             return client;
         }
 
-        private static async Task<List<TResult>> MapWithConcurrencyAsync<TSource, TResult>(
-            IEnumerable<TSource> source, int maxConcurrency, Func<TSource, Task<TResult>> selector)
+        private async Task<(List<XoaVm> vms, Dictionary<string, string> hosts)> GetVmsAndHostsAsync(
+            HttpClient client, string baseUrl, CancellationToken ct)
         {
-            using var semaphore = new SemaphoreSlim(maxConcurrency);
-            var tasks = source.Select(async item =>
+            var vmUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/vms", ct);
+            var vmResults = await MapWithConcurrencyAsync(vmUrls, MaxConcurrency,
+                vmUrl => GetJsonAsync<XoaVm>(client, $"{baseUrl}{vmUrl}", ct));
+
+            var vms = vmResults
+                .Where(vm => vm != null && !vm.is_a_template && !vm.is_control_domain)
+                .Select(vm => vm!)
+                .GroupBy(v => v.uuid)
+                .Select(g => g.First())
+                .ToList();
+
+            var hostUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/hosts", ct);
+            var hostResults = await MapWithConcurrencyAsync(hostUrls, MaxConcurrency,
+                hostUrl => GetJsonAsync<XoaHost>(client, $"{baseUrl}{hostUrl}", ct));
+
+            var hosts = new Dictionary<string, string>();
+            foreach (var host in hostResults)
             {
-                await semaphore.WaitAsync();
-                try
+                if (host != null && !string.IsNullOrEmpty(host.uuid))
                 {
-                    return await selector(item);
+                    hosts[host.uuid] = host.name_label ?? "Unknown-Host";
                 }
-                finally
-                {
-                    semaphore.Release();
-                }
-            });
-            return (await Task.WhenAll(tasks)).ToList();
+            }
+
+            return (vms, hosts);
+        }
+
+        private async Task<List<XoaBackupLog>> GetBackupLogsAsync(HttpClient client, string baseUrl, CancellationToken ct)
+        {
+            var logUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/backup-logs", ct);
+            var logResults = await MapWithConcurrencyAsync(logUrls, MaxConcurrency,
+                logUrl => GetJsonAsync<XoaBackupLog>(client, $"{baseUrl}{logUrl}", ct));
+
+            return logResults.Where(l => l != null).Select(l => l!).ToList();
+        }
+
+        private static string BuildFullVmName(XoaVm vm, Dictionary<string, string> hosts)
+        {
+            string hostName = "Unknown-Host";
+            if (!string.IsNullOrEmpty(vm.container) && hosts.ContainsKey(vm.container))
+            {
+                hostName = hosts[vm.container];
+            }
+            return $"{hostName}-{vm.name_label ?? "Unknown"}";
         }
 
         private static bool IsCanceled(XoaBackupTask task, out string cancelReason)
@@ -157,6 +213,55 @@ namespace XOABackupMonitorWeb.Services
             return false;
         }
 
+        private static (BackupStatus Status, string StatusText, string MessageDetail, double TimeDiffHours) ClassifyTask(
+            XoaBackupTask vmTask, string? jobName, DateTime currentTime)
+        {
+            var lastBackupTime = DateTimeOffset.FromUnixTimeMilliseconds(vmTask.start).LocalDateTime;
+            var timeDiff = (currentTime - lastBackupTime).TotalHours;
+            BackupStatus status;
+            string statusText;
+            string messageDetail;
+
+            if (vmTask.status == "pending" || vmTask.status == "running")
+            {
+                status = BackupStatus.Warning;
+                statusText = "IN PROGRESS";
+                messageDetail = jobName ?? "N/A";
+            }
+            else if (IsCanceled(vmTask, out string cancelReason))
+            {
+                status = BackupStatus.Warning;
+                statusText = "CANCELED";
+                messageDetail = $"{jobName ?? "N/A"} - {(string.IsNullOrWhiteSpace(cancelReason) ? "Job canceled" : cancelReason)}";
+            }
+            else if (vmTask.status == "success" && timeDiff < 24)
+            {
+                status = BackupStatus.Success;
+                statusText = "SUCCESS";
+                messageDetail = jobName ?? "N/A";
+            }
+            else if (vmTask.status == "failure" || vmTask.status == "interrupted")
+            {
+                status = BackupStatus.Failed;
+                statusText = "FAILED";
+                messageDetail = jobName ?? "N/A";
+            }
+            else if (timeDiff >= 24)
+            {
+                status = BackupStatus.Warning;
+                statusText = "WARNING";
+                messageDetail = jobName ?? "N/A";
+            }
+            else
+            {
+                status = BackupStatus.Success;
+                statusText = "SUCCESS";
+                messageDetail = jobName ?? "N/A";
+            }
+
+            return (status, statusText, messageDetail, timeDiff);
+        }
+
         private List<VMBackupStatus> GenerateBackupReport(
             List<XoaVm> vms, List<XoaBackupLog> backupLogs, Dictionary<string, string> hosts, string instanceName)
         {
@@ -171,13 +276,7 @@ namespace XOABackupMonitorWeb.Services
 
                 processedVMs.Add(vm.uuid ?? "");
 
-                string hostName = "Unknown-Host";
-                if (!string.IsNullOrEmpty(vm.container) && hosts.ContainsKey(vm.container))
-                {
-                    hostName = hosts[vm.container];
-                }
-
-                string fullVmName = $"{hostName}-{vm.name_label ?? "Unknown"}";
+                string fullVmName = BuildFullVmName(vm, hosts);
 
                 var vmBackups = backupLogs
                     .Where(log => log.tasks != null && log.tasks.Count > 0 &&
@@ -196,57 +295,14 @@ namespace XOABackupMonitorWeb.Services
 
                         if (vmTask != null)
                         {
-                            var lastBackupTime = DateTimeOffset
-                                .FromUnixTimeMilliseconds(vmTask.start)
-                                .LocalDateTime;
-
-                            var timeDiff = (currentTime - lastBackupTime).TotalHours;
-                            BackupStatus status;
-                            string statusText;
-                            string messageDetail;
-
-                            if (vmTask.status == "pending" || vmTask.status == "running")
-                            {
-                                status = BackupStatus.Warning;
-                                statusText = "IN PROGRESS";
-                                messageDetail = latestBackupLog.jobName ?? "N/A";
-                            }
-                            else if (IsCanceled(vmTask, out string cancelReason))
-                            {
-                                status = BackupStatus.Warning;
-                                statusText = "CANCELED";
-                                messageDetail = $"{latestBackupLog.jobName ?? "N/A"} - {(string.IsNullOrWhiteSpace(cancelReason) ? "Job canceled" : cancelReason)}";
-                            }
-                            else if (vmTask.status == "success" && timeDiff < 24)
-                            {
-                                status = BackupStatus.Success;
-                                statusText = "SUCCESS";
-                                messageDetail = latestBackupLog.jobName ?? "N/A";
-                            }
-                            else if (vmTask.status == "failure" || vmTask.status == "interrupted")
-                            {
-                                status = BackupStatus.Failed;
-                                statusText = "FAILED";
-                                messageDetail = latestBackupLog.jobName ?? "N/A";
-                            }
-                            else if (timeDiff >= 24)
-                            {
-                                status = BackupStatus.Warning;
-                                statusText = "WARNING";
-                                messageDetail = latestBackupLog.jobName ?? "N/A";
-                            }
-                            else
-                            {
-                                status = BackupStatus.Success;
-                                statusText = "SUCCESS";
-                                messageDetail = latestBackupLog.jobName ?? "N/A";
-                            }
+                            var (status, statusText, messageDetail, timeDiff) =
+                                ClassifyTask(vmTask, latestBackupLog.jobName, currentTime);
 
                             report.Add(new VMBackupStatus
                             {
                                 InstanceName = instanceName,
                                 VMName = fullVmName,
-                                LastBackupTime = lastBackupTime,
+                                LastBackupTime = DateTimeOffset.FromUnixTimeMilliseconds(vmTask.start).LocalDateTime,
                                 Status = status,
                                 Message = $"{statusText} - {messageDetail} ({Math.Round(timeDiff, 1)} hours ago)"
                             });
@@ -267,6 +323,25 @@ namespace XOABackupMonitorWeb.Services
             }
 
             return report;
+        }
+
+        private static async Task<List<TResult>> MapWithConcurrencyAsync<TSource, TResult>(
+            IEnumerable<TSource> source, int maxConcurrency, Func<TSource, Task<TResult>> selector)
+        {
+            using var semaphore = new SemaphoreSlim(maxConcurrency);
+            var tasks = source.Select(async item =>
+            {
+                await semaphore.WaitAsync();
+                try
+                {
+                    return await selector(item);
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            });
+            return (await Task.WhenAll(tasks)).ToList();
         }
 
         private static async Task<T?> GetJsonAsync<T>(HttpClient client, string url, CancellationToken ct)

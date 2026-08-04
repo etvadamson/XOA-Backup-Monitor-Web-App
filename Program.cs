@@ -88,6 +88,24 @@ app.MapPost("/api/test-connection", async (TestConnectionRequest req, XoaApiServ
     return Results.Ok(new { success = ok });
 });
 
+app.MapGet("/api/history", async (string instance, string vm, ConfigService configService, XoaApiService apiService, CancellationToken ct) =>
+{
+    var instances = await configService.LoadInstancesAsync();
+    var inst = instances.FirstOrDefault(i => i.Name == instance);
+    if (inst == null)
+    {
+        return Results.NotFound(new { error = "Instance not found." });
+    }
+
+    if (string.IsNullOrEmpty(inst.ApiToken))
+    {
+        return Results.BadRequest(new { error = "No API token configured for this instance." });
+    }
+
+    var history = await apiService.GetVmHistoryAsync(inst.Url, inst.ApiToken, vm, ct);
+    return Results.Ok(history);
+});
+
 app.MapGet("/api/settings", async (ConfigService configService) =>
     Results.Ok(new { refreshIntervalMinutes = await configService.GetGlobalRefreshIntervalAsync() }));
 
