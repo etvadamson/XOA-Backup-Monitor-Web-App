@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>XOA Backup Monitor</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="header">
+    <div class="header-left">
+      <h1>XOA Backup Monitor <span class="badge">Web</span></h1>
+      <div class="overall-row">
+        <span>Overall Status:</span>
+        <span id="overallStatus" class="status-pill">Loading...</span>
+      </div>
+      <div id="summaryText" class="summary-text">-</div>
+    </div>
+    <div class="header-right">
+      <button id="refreshBtn">Refresh Now</button>
+      <button id="exportBtn">Export CSV</button>
+      <button id="configureBtn">Configure</button>
+    </div>
+  </header>
+
+  <main id="groups" class="groups"></main>
+
+  <footer class="footer">
+    <span id="lastRefreshText">Not refreshed yet</span>
+    <span id="totalVmCount">Total VMs: 0</span>
+  </footer>
+
+  <div id="configModal" class="modal hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>Configuration</h2>
+        <button id="closeConfigBtn" class="close-btn">&times;</button>
+      </div>
+
+      <section>
+        <h3>Global Settings</h3>
+        <label>
+          Refresh Interval (minutes):
+          <input type="number" id="refreshIntervalInput" min="1" value="30" />
+        </label>
+        <button id="saveIntervalBtn">Save Interval</button>
+      </section>
+
+      <section>
+        <h3>XOA Instances</h3>
+        <table id="instanceTable">
+          <thead>
+            <tr><th>Name</th><th>URL</th><th>Enabled</th><th>Token Set</th><th></th></tr>
+          </thead>
+          <tbody id="instanceTableBody"></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h3>Add / Update Instance</h3>
+        <form id="instanceForm">
+          <label>Name <input type="text" id="instanceName" required /></label>
+          <label>URL <input type="text" id="instanceUrl" placeholder="https://xoa.example.com" required /></label>
+          <label>API Token <input type="password" id="instanceToken" placeholder="Leave blank to keep existing" /></label>
+          <label class="checkbox-label"><input type="checkbox" id="instanceEnabled" checked /> Enabled</label>
+          <div class="form-actions">
+            <button type="submit">Save Instance</button>
+            <button type="button" id="testConnectionBtn">Test Connection</button>
+          </div>
+          <div id="testResult"></div>
+        </form>
+      </section>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
