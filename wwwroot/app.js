@@ -53,11 +53,22 @@ function renderStatus(data) {
     summary.textContent = group.summary;
     card.appendChild(summary);
 
+    const columnHeader = document.createElement('div');
+    columnHeader.className = 'vm-header';
+    columnHeader.innerHTML = `
+      <span>VM Name</span>
+      <span>Status</span>
+      <span>Last Backup</span>
+      <span>Hours Ago</span>
+      <span>Message</span>
+    `;
+    card.appendChild(columnHeader);
+
     for (const vm of group.vms) {
       const row = document.createElement('div');
       row.className = `vm-row status-${vm.status}`;
       row.innerHTML = `
-        <span>${escapeHtml(vm.vMName)}</span>
+        <span>${escapeHtml(vm.vmName)}</span>
         <span class="status-chip" style="background:${vm.statusColor}">${escapeHtml(vm.statusText)}</span>
         <span>${escapeHtml(vm.formattedLastBackup)}</span>
         <span>${typeof vm.ageInHours === 'number' ? vm.ageInHours.toFixed(1) : ''} hrs</span>

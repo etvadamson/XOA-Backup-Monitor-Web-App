@@ -1,5 +1,3 @@
-using System.Text.Json.Serialization;
-
 namespace XOABackupMonitorWeb.Models
 {
     public class VMBackupStatus
@@ -10,7 +8,6 @@ namespace XOABackupMonitorWeb.Models
         public BackupStatus Status { get; set; }
         public string Message { get; set; } = string.Empty;
 
-        [JsonIgnore]
         public double AgeInHours => LastBackupTime.HasValue
             ? (DateTime.Now - LastBackupTime.Value).TotalHours
             : 0;

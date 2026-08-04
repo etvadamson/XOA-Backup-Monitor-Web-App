@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using XOABackupMonitorWeb.Models;
 using XOABackupMonitorWeb.Services;
 
@@ -9,6 +10,11 @@ builder.Services.AddSingleton<ConfigService>();
 builder.Services.AddSingleton<CacheService>();
 builder.Services.AddSingleton<MonitorEngine>();
 builder.Services.AddHostedService<RefreshBackgroundService>();
+
+builder.Services.ConfigureHttpJsonOptions(options =>
+{
+    options.SerializerOptions.Converters.Add(new JsonStringEnumConverter());
+});
 
 var app = builder.Build();
 

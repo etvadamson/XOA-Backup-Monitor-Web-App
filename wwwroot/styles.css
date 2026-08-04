@@ -92,6 +92,20 @@ body {
   background: #262626;
 }
 
+.vm-header {
+  display: grid;
+  grid-template-columns: 280px 110px 170px 90px 1fr;
+  gap: 10px;
+  padding: 8px 14px;
+  background: #333333;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: bold;
+  color: #f0f0f0;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
 .vm-row {
   display: grid;
   grid-template-columns: 280px 110px 170px 90px 1fr;
@@ -103,9 +117,9 @@ body {
 }
 .vm-row:last-child { border-bottom: none; }
 
-.vm-row.status-Failed { background: #2f1c1c; }
-.vm-row.status-Warning { background: #332a1c; }
-.vm-row.status-Error { background: #2a1c2f; }
+.vm-row.status-Failed { background: #663333; }
+.vm-row.status-Warning { background: #664d33; }
+.vm-row.status-Error { background: #4d334d; }
 
 .status-chip {
   display: inline-block;
