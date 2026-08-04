@@ -1,0 +1,9 @@
+services:
+  xoa-backup-monitor-web:
+    build: .
+    container_name: xoa-backup-monitor-web
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
