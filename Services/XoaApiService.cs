@@ -71,7 +71,6 @@ namespace XOABackupMonitorWeb.Services
             }
 
             var backupLogs = await GetBackupLogsAsync(client, baseUrl, ct);
-            var currentTime = DateTime.Now;
             var entries = new List<VmHistoryEntry>();
 
             foreach (var log in backupLogs)
@@ -82,7 +81,7 @@ namespace XOABackupMonitorWeb.Services
                     continue;
                 }
 
-                var (status, statusText, messageDetail, _) = ClassifyTask(vmTask, log.jobName, currentTime);
+                var (status, statusText, messageDetail) = ClassifyHistoricalTask(vmTask, log.jobName);
 
                 if (statusText == "IN PROGRESS")
                 {
@@ -260,6 +259,33 @@ namespace XOABackupMonitorWeb.Services
             }
 
             return (status, statusText, messageDetail, timeDiff);
+        }
+
+        private static (BackupStatus Status, string StatusText, string MessageDetail) ClassifyHistoricalTask(
+            XoaBackupTask vmTask, string? jobName)
+        {
+            if (vmTask.status == "pending" || vmTask.status == "running")
+            {
+                return (BackupStatus.Warning, "IN PROGRESS", jobName ?? "N/A");
+            }
+
+            if (IsCanceled(vmTask, out string cancelReason))
+            {
+                var msg = $"{jobName ?? "N/A"} - {(string.IsNullOrWhiteSpace(cancelReason) ? "Job canceled" : cancelReason)}";
+                return (BackupStatus.Warning, "CANCELED", msg);
+            }
+
+            if (vmTask.status == "success")
+            {
+                return (BackupStatus.Success, "SUCCESS", jobName ?? "N/A");
+            }
+
+            if (vmTask.status == "failure" || vmTask.status == "interrupted")
+            {
+                return (BackupStatus.Failed, "FAILED", jobName ?? "N/A");
+            }
+
+            return (BackupStatus.Unknown, "UNKNOWN", jobName ?? "N/A");
         }
 
         private List<VMBackupStatus> GenerateBackupReport(
