@@ -39,8 +39,10 @@ namespace XOABackupMonitorWeb.Services
             }
         }
 
-        public object GetStatusSnapshot()
+        public object GetStatusSnapshot(Dictionary<string, string>? instanceUrls = null)
         {
+            instanceUrls ??= new Dictionary<string, string>();
+
             lock (_stateLock)
             {
                 var grouped = _currentBackups
@@ -49,6 +51,7 @@ namespace XOABackupMonitorWeb.Services
                     .Select(g => new
                     {
                         instanceName = g.Key,
+                        instanceUrl = instanceUrls.TryGetValue(g.Key ?? "", out var url) ? url : "",
                         summary = BuildSummary(g.ToList()),
                         statusText = BuildGroupStatusText(g.ToList()),
                         statusColor = BuildGroupStatusColor(g.ToList()),
@@ -119,12 +122,6 @@ namespace XOABackupMonitorWeb.Services
             await _cacheService.SaveCacheAsync(snapshot);
         }
 
-        /// <summary>
-        /// Immediately strips all cached VM/backup entries for an instance from both
-        /// in-memory state and the on-disk cache. Called right after an instance is
-        /// deleted from config so the dashboard reflects the removal instantly instead
-        /// of waiting for the next full "Refresh Now" or background refresh cycle.
-        /// </summary>
         public async Task RemoveInstanceAsync(string instanceName)
         {
             List<VMBackupStatus> snapshot;

@@ -1,8 +1,11 @@
 const overallStatusEl = document.getElementById('overallStatus');
 const summaryTextEl = document.getElementById('summaryText');
-const groupsEl = document.getElementById('groups');
+const groupedViewEl = document.getElementById('groupedView');
+const tableViewEl = document.getElementById('tableView');
 const lastRefreshEl = document.getElementById('lastRefreshText');
 const totalVmCountEl = document.getElementById('totalVmCount');
+const instancePillsEl = document.getElementById('instancePills');
+const allVmsTableBodyEl = document.getElementById('allVmsTableBody');
 
 const statusColors = {
   Success: '#2ecc71',
@@ -12,9 +15,67 @@ const statusColors = {
   Unknown: '#95a5a6'
 };
 
+let currentView = localStorage.getItem('xoaView') || 'grouped';
+let currentTheme = localStorage.getItem('xoaTheme') || 'dark';
+let sortKey = 'instanceName';
+let sortAsc = true;
+let latestStatusData = null;
+
+const expandOverrides = new Map();
+
+applyTheme(currentTheme);
+applyView(currentView);
+
+function applyTheme(theme) {
+  document.body.setAttribute('data-theme', theme);
+  const btn = document.getElementById('themeToggleBtn');
+  btn.textContent = theme === 'dark' ? 'Dark' : 'Light';
+  localStorage.setItem('xoaTheme', theme);
+}
+
+function applyView(view) {
+  const btn = document.getElementById('viewToggleBtn');
+  if (view === 'table') {
+    groupedViewEl.classList.add('hidden');
+    tableViewEl.classList.remove('hidden');
+    btn.textContent = 'Switch to Grouped View';
+  } else {
+    groupedViewEl.classList.remove('hidden');
+    tableViewEl.classList.add('hidden');
+    btn.textContent = 'Switch to Table View';
+  }
+  localStorage.setItem('xoaView', view);
+}
+
+document.getElementById('themeToggleBtn').addEventListener('click', () => {
+  currentTheme = currentTheme === 'dark' ? 'light' : 'dark';
+  applyTheme(currentTheme);
+});
+
+document.getElementById('viewToggleBtn').addEventListener('click', () => {
+  currentView = currentView === 'grouped' ? 'table' : 'grouped';
+  applyView(currentView);
+  if (latestStatusData) renderStatus(latestStatusData);
+});
+
+document.getElementById('collapseAllBtn').addEventListener('click', () => {
+  if (!latestStatusData || !latestStatusData.groups) return;
+  const anyExpanded = latestStatusData.groups.some(g => resolveExpanded(g));
+  latestStatusData.groups.forEach(g => expandOverrides.set(g.instanceName, !anyExpanded));
+  renderStatus(latestStatusData);
+});
+
+function resolveExpanded(group) {
+  if (expandOverrides.has(group.instanceName)) {
+    return expandOverrides.get(group.instanceName);
+  }
+  return group.statusText !== 'ALL OK';
+}
+
 async function fetchStatus() {
   const res = await fetch('/api/status');
   const data = await res.json();
+  latestStatusData = data;
   renderStatus(data);
 }
 
@@ -27,21 +88,34 @@ function renderStatus(data) {
     : 'Not refreshed yet';
   totalVmCountEl.textContent = `Total VMs: ${data.totalVmCount}`;
 
-  groupsEl.innerHTML = '';
+  if (currentView === 'table') {
+    renderTableView(data);
+  } else {
+    renderGroupedView(data);
+  }
+}
+
+function renderGroupedView(data) {
+  groupedViewEl.innerHTML = '';
 
   if (!data.groups || data.groups.length === 0) {
-    groupsEl.innerHTML = '<p style="color:#909090">No data yet. Add an XOA instance via Configure, then click Refresh Now.</p>';
+    groupedViewEl.innerHTML = '<p style="color:#909090">No data yet. Add an XOA instance via Configure, then click Refresh Now.</p>';
     return;
   }
 
   for (const group of data.groups) {
+    const isExpanded = resolveExpanded(group);
+
     const card = document.createElement('div');
     card.className = 'group-card';
 
     const header = document.createElement('div');
     header.className = 'group-header';
     header.innerHTML = `
-      <span class="name">${escapeHtml(group.instanceName)}</span>
+      <button class="icon-btn expand-toggle" data-instance="${escapeHtml(group.instanceName)}" title="Expand/collapse">${isExpanded ? '&#9660;' : '&#9654;'}</button>
+      ${group.instanceUrl
+        ? `<a href="${escapeHtml(group.instanceUrl)}" target="_blank" rel="noopener noreferrer" class="instance-link name">${escapeHtml(group.instanceName)}</a>`
+        : `<span class="name">${escapeHtml(group.instanceName)}</span>`}
       <button class="icon-btn" title="Refresh this instance" data-instance="${escapeHtml(group.instanceName)}">&#128260;</button>
       <span class="spacer"></span>
       <span class="status-chip" style="background:${group.statusColor}">${escapeHtml(group.statusText)}</span>
@@ -53,34 +127,46 @@ function renderStatus(data) {
     summary.textContent = group.summary;
     card.appendChild(summary);
 
-    const columnHeader = document.createElement('div');
-    columnHeader.className = 'vm-header';
-    columnHeader.innerHTML = `
-      <span>VM Name</span>
-      <span>Status</span>
-      <span>Last Backup</span>
-      <span>Hours Ago</span>
-      <span>Message</span>
-    `;
-    card.appendChild(columnHeader);
-
-    for (const vm of group.vms) {
-      const row = document.createElement('div');
-      row.className = `vm-row status-${vm.status}`;
-      row.innerHTML = `
-        <span><a href="#" class="vm-link" data-instance="${escapeHtml(group.instanceName)}" data-vm="${escapeHtml(vm.vmName)}">${escapeHtml(vm.vmName)}</a></span>
-        <span class="status-chip" style="background:${vm.statusColor}">${escapeHtml(vm.statusText)}</span>
-        <span>${escapeHtml(vm.formattedLastBackup)}</span>
-        <span>${typeof vm.ageInHours === 'number' ? vm.ageInHours.toFixed(1) : ''} hrs</span>
-        <span>${escapeHtml(vm.message)}</span>
+    if (isExpanded) {
+      const columnHeader = document.createElement('div');
+      columnHeader.className = 'vm-header';
+      columnHeader.innerHTML = `
+        <span>VM Name</span>
+        <span>Status</span>
+        <span>Last Backup</span>
+        <span>Hours Ago</span>
+        <span>Message</span>
       `;
-      card.appendChild(row);
+      card.appendChild(columnHeader);
+
+      for (const vm of group.vms) {
+        const row = document.createElement('div');
+        row.className = `vm-row status-${vm.status}`;
+        row.innerHTML = `
+          <span><a href="#" class="vm-link" data-instance="${escapeHtml(group.instanceName)}" data-vm="${escapeHtml(vm.vmName)}">${escapeHtml(vm.vmName)}</a></span>
+          <span class="status-chip" style="background:${vm.statusColor}">${escapeHtml(vm.statusText)}</span>
+          <span>${escapeHtml(vm.formattedLastBackup)}</span>
+          <span>${typeof vm.ageInHours === 'number' ? vm.ageInHours.toFixed(1) : ''} hrs</span>
+          <span>${escapeHtml(vm.message)}</span>
+        `;
+        card.appendChild(row);
+      }
     }
 
-    groupsEl.appendChild(card);
+    groupedViewEl.appendChild(card);
   }
 
-  document.querySelectorAll('[data-instance].icon-btn').forEach(btn => {
+  document.querySelectorAll('.expand-toggle').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const name = e.currentTarget.getAttribute('data-instance');
+      const group = latestStatusData.groups.find(g => g.instanceName === name);
+      expandOverrides.set(name, !resolveExpanded(group));
+      renderStatus(latestStatusData);
+    });
+  });
+
+  document.querySelectorAll('.group-header > .icon-btn[data-instance]:not(.expand-toggle)').forEach(btn => {
     btn.addEventListener('click', async (e) => {
       const name = e.currentTarget.getAttribute('data-instance');
       await fetch(`/api/refresh/${encodeURIComponent(name)}`, { method: 'POST' });
@@ -97,6 +183,82 @@ function renderStatus(data) {
     });
   });
 }
+
+function flattenVms(data) {
+  const rows = [];
+  for (const group of (data.groups || [])) {
+    for (const vm of group.vms) {
+      rows.push({ ...vm, instanceName: group.instanceName, instanceUrl: group.instanceUrl });
+    }
+  }
+  return rows;
+}
+
+function renderTableView(data) {
+  instancePillsEl.innerHTML = (data.groups || []).map(g => `
+    <span class="instance-pill" style="background:${g.statusColor}">
+      ${g.instanceUrl
+        ? `<a href="${escapeHtml(g.instanceUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(g.instanceName)}</a>`
+        : escapeHtml(g.instanceName)}
+      <button class="icon-btn" data-instance="${escapeHtml(g.instanceName)}" title="Refresh">&#128260;</button>
+    </span>
+  `).join('');
+
+  instancePillsEl.querySelectorAll('[data-instance]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const name = e.currentTarget.getAttribute('data-instance');
+      await fetch(`/api/refresh/${encodeURIComponent(name)}`, { method: 'POST' });
+      fetchStatus();
+    });
+  });
+
+  let rows = flattenVms(data);
+
+  rows.sort((a, b) => {
+    let av = a[sortKey];
+    let bv = b[sortKey];
+    if (typeof av === 'string') av = av.toLowerCase();
+    if (typeof bv === 'string') bv = bv.toLowerCase();
+    if (av < bv) return sortAsc ? -1 : 1;
+    if (av > bv) return sortAsc ? 1 : -1;
+    return 0;
+  });
+
+  allVmsTableBodyEl.innerHTML = rows.map(vm => `
+    <tr class="status-${vm.status}">
+      <td><span class="status-dot" style="background:${vm.statusColor}"></span></td>
+      <td>${escapeHtml(vm.instanceName)}</td>
+      <td><a href="#" class="vm-link" data-instance="${escapeHtml(vm.instanceName)}" data-vm="${escapeHtml(vm.vmName)}">${escapeHtml(vm.vmName)}</a></td>
+      <td>${escapeHtml(vm.statusText)}</td>
+      <td>${escapeHtml(vm.formattedLastBackup)}</td>
+      <td>${typeof vm.ageInHours === 'number' ? vm.ageInHours.toFixed(1) : ''}</td>
+      <td>${escapeHtml(vm.message)}</td>
+    </tr>
+  `).join('');
+
+  allVmsTableBodyEl.querySelectorAll('.vm-link').forEach(link => {
+    link.addEventListener('click', (e) => {
+      e.preventDefault();
+      const instance = e.currentTarget.getAttribute('data-instance');
+      const vm = e.currentTarget.getAttribute('data-vm');
+      openHistoryModal(instance, vm);
+    });
+  });
+}
+
+document.querySelectorAll('#allVmsTable th[data-key]').forEach(th => {
+  th.addEventListener('click', () => {
+    const key = th.getAttribute('data-key');
+    if (key === 'statusDot') return;
+    if (sortKey === key) {
+      sortAsc = !sortAsc;
+    } else {
+      sortKey = key;
+      sortAsc = true;
+    }
+    if (latestStatusData) renderTableView(latestStatusData);
+  });
+});
 
 function escapeHtml(str) {
   if (str === null || str === undefined) return '';

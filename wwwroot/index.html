@@ -6,7 +6,7 @@
   <title>XOA Backup Monitor</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
-<body>
+<body data-theme="dark">
   <header class="header">
     <div class="header-left">
       <h1>XOA Backup Monitor <span class="badge">Web</span></h1>
@@ -17,13 +17,34 @@
       <div id="summaryText" class="summary-text">-</div>
     </div>
     <div class="header-right">
+      <button id="collapseAllBtn" class="icon-only-btn" title="Collapse/expand all instances">&#9660;</button>
+      <button id="themeToggleBtn">Dark</button>
+      <button id="viewToggleBtn">Switch to Table View</button>
       <button id="refreshBtn">Refresh Now</button>
       <button id="exportBtn">Export CSV</button>
       <button id="configureBtn">Configure</button>
     </div>
   </header>
 
-  <main id="groups" class="groups"></main>
+  <main id="groupedView" class="groups"></main>
+
+  <main id="tableView" class="table-view hidden">
+    <div id="instancePills" class="instance-pills"></div>
+    <table id="allVmsTable" class="sortable-table">
+      <thead>
+        <tr>
+          <th data-key="statusDot" class="col-dot"></th>
+          <th data-key="instanceName">Instance</th>
+          <th data-key="vmName">VM Name</th>
+          <th data-key="statusText">Status</th>
+          <th data-key="formattedLastBackup">Last Backup</th>
+          <th data-key="ageInHours">Hours Ago</th>
+          <th data-key="message">Message</th>
+        </tr>
+      </thead>
+      <tbody id="allVmsTableBody"></tbody>
+    </table>
+  </main>
 
   <footer class="footer">
     <span id="lastRefreshText">Not refreshed yet</span>

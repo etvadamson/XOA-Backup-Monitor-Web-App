@@ -21,18 +21,30 @@ var app = builder.Build();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
-app.MapGet("/api/status", (MonitorEngine engine) => Results.Ok(engine.GetStatusSnapshot()));
-
-app.MapPost("/api/refresh", async (MonitorEngine engine) =>
+async Task<Dictionary<string, string>> BuildInstanceUrlMapAsync(ConfigService configService)
 {
-    await engine.RefreshAllAsync(CancellationToken.None);
-    return Results.Ok(engine.GetStatusSnapshot());
+    var instances = await configService.LoadInstancesAsync();
+    return instances.ToDictionary(i => i.Name, i => i.Url);
+}
+
+app.MapGet("/api/status", async (MonitorEngine engine, ConfigService configService) =>
+{
+    var instanceUrls = await BuildInstanceUrlMapAsync(configService);
+    return Results.Ok(engine.GetStatusSnapshot(instanceUrls));
 });
 
-app.MapPost("/api/refresh/{instanceName}", async (string instanceName, MonitorEngine engine) =>
+app.MapPost("/api/refresh", async (MonitorEngine engine, ConfigService configService) =>
+{
+    await engine.RefreshAllAsync(CancellationToken.None);
+    var instanceUrls = await BuildInstanceUrlMapAsync(configService);
+    return Results.Ok(engine.GetStatusSnapshot(instanceUrls));
+});
+
+app.MapPost("/api/refresh/{instanceName}", async (string instanceName, MonitorEngine engine, ConfigService configService) =>
 {
     await engine.RefreshInstanceAsync(instanceName, CancellationToken.None);
-    return Results.Ok(engine.GetStatusSnapshot());
+    var instanceUrls = await BuildInstanceUrlMapAsync(configService);
+    return Results.Ok(engine.GetStatusSnapshot(instanceUrls));
 });
 
 app.MapGet("/api/export/csv", (MonitorEngine engine) =>
