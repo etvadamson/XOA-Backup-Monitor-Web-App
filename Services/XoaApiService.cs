@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -9,7 +10,11 @@ namespace XOABackupMonitorWeb.Services
     {
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<XoaApiService> _logger;
-        private const int MaxConcurrency = 5;
+        private const int MaxConcurrency = 12;
+
+        private static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(10);
+        private readonly ConcurrentDictionary<string, (DateTime CachedAt, List<XoaVm> Vms, Dictionary<string, string> Hosts)> _vmsHostsCache = new();
+        private readonly ConcurrentDictionary<string, (DateTime CachedAt, List<XoaBackupLog> Logs)> _backupLogsCache = new();
 
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
@@ -29,8 +34,8 @@ namespace XOABackupMonitorWeb.Services
 
             try
             {
-                var (vms, hosts) = await GetVmsAndHostsAsync(client, baseUrl, ct);
-                var backupLogs = await GetBackupLogsAsync(client, baseUrl, ct);
+                var (vms, hosts) = await GetVmsAndHostsAsync(client, baseUrl, ct, allowCacheRead: false);
+                var backupLogs = await GetBackupLogsAsync(client, baseUrl, ct, allowCacheRead: false);
 
                 _logger.LogInformation("[{Instance}] Found {Count} hosts: {Hosts}",
                     instanceName, hosts.Count, string.Join(", ", hosts.Values));
@@ -53,7 +58,7 @@ namespace XOABackupMonitorWeb.Services
         {
             var client = CreateClient(apiToken);
 
-            var (vms, hosts) = await GetVmsAndHostsAsync(client, baseUrl, ct);
+            var (vms, hosts) = await GetVmsAndHostsAsync(client, baseUrl, ct, allowCacheRead: true);
 
             XoaVm? targetVm = null;
             foreach (var vm in vms)
@@ -70,7 +75,7 @@ namespace XOABackupMonitorWeb.Services
                 return new List<VmHistoryEntry>();
             }
 
-            var backupLogs = await GetBackupLogsAsync(client, baseUrl, ct);
+            var backupLogs = await GetBackupLogsAsync(client, baseUrl, ct, allowCacheRead: true);
             var entries = new List<VmHistoryEntry>();
 
             foreach (var log in backupLogs)
@@ -124,8 +129,15 @@ namespace XOABackupMonitorWeb.Services
         }
 
         private async Task<(List<XoaVm> vms, Dictionary<string, string> hosts)> GetVmsAndHostsAsync(
-            HttpClient client, string baseUrl, CancellationToken ct)
+            HttpClient client, string baseUrl, CancellationToken ct, bool allowCacheRead)
         {
+            if (allowCacheRead &&
+                _vmsHostsCache.TryGetValue(baseUrl, out var cached) &&
+                DateTime.UtcNow - cached.CachedAt < CacheTtl)
+            {
+                return (cached.Vms, cached.Hosts);
+            }
+
             var vmUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/vms", ct);
             var vmResults = await MapWithConcurrencyAsync(vmUrls, MaxConcurrency,
                 vmUrl => GetJsonAsync<XoaVm>(client, $"{baseUrl}{vmUrl}", ct));
@@ -150,16 +162,28 @@ namespace XOABackupMonitorWeb.Services
                 }
             }
 
+            _vmsHostsCache[baseUrl] = (DateTime.UtcNow, vms, hosts);
             return (vms, hosts);
         }
 
-        private async Task<List<XoaBackupLog>> GetBackupLogsAsync(HttpClient client, string baseUrl, CancellationToken ct)
+        private async Task<List<XoaBackupLog>> GetBackupLogsAsync(
+            HttpClient client, string baseUrl, CancellationToken ct, bool allowCacheRead)
         {
+            if (allowCacheRead &&
+                _backupLogsCache.TryGetValue(baseUrl, out var cached) &&
+                DateTime.UtcNow - cached.CachedAt < CacheTtl)
+            {
+                return cached.Logs;
+            }
+
             var logUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/backup-logs", ct);
             var logResults = await MapWithConcurrencyAsync(logUrls, MaxConcurrency,
                 logUrl => GetJsonAsync<XoaBackupLog>(client, $"{baseUrl}{logUrl}", ct));
 
-            return logResults.Where(l => l != null).Select(l => l!).ToList();
+            var logs = logResults.Where(l => l != null).Select(l => l!).ToList();
+
+            _backupLogsCache[baseUrl] = (DateTime.UtcNow, logs);
+            return logs;
         }
 
         private static string BuildFullVmName(XoaVm vm, Dictionary<string, string> hosts)
