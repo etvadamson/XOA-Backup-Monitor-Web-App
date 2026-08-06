@@ -64,7 +64,11 @@
           Refresh Interval (minutes):
           <input type="number" id="refreshIntervalInput" min="1" value="30" />
         </label>
-        <button id="saveIntervalBtn">Save Interval</button>
+        <label>
+          Max Concurrent Requests:
+          <input type="number" id="maxConcurrentRequestsInput" min="1" value="12" />
+        </label>
+        <button id="saveIntervalBtn">Save Settings</button>
       </section>
 
       <section>
@@ -78,15 +82,17 @@
       </section>
 
       <section>
-        <h3>Add / Update Instance</h3>
+        <h3 id="instanceFormTitle">Add / Update Instance</h3>
         <form id="instanceForm">
+          <input type="hidden" id="instanceId" value="" />
           <label>Name <input type="text" id="instanceName" required /></label>
           <label>URL <input type="text" id="instanceUrl" placeholder="https://xoa.example.com" required /></label>
           <label>API Token <input type="password" id="instanceToken" placeholder="Leave blank to keep existing" /></label>
           <label class="checkbox-label"><input type="checkbox" id="instanceEnabled" checked /> Enabled</label>
           <div class="form-actions">
-            <button type="submit">Save Instance</button>
+            <button type="submit" id="saveInstanceBtn">Save Instance</button>
             <button type="button" id="testConnectionBtn">Test Connection</button>
+            <button type="button" id="cancelEditBtn" class="hidden">Cancel Edit / New Instance</button>
           </div>
           <div id="testResult"></div>
         </form>
