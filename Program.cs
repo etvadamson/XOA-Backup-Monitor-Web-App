@@ -69,6 +69,49 @@ app.MapPost("/api/instances", async (XOAInstance instance, ConfigService configS
     return Results.Ok(await configService.LoadInstanceSummariesAsync());
 });
 
+// Updates an existing instance by its stable Id. Used by the "click a row to edit,
+// then Save Instance" flow so edits target the right record instead of matching/creating
+// by Name (which broke if the user also changed the Name field).
+app.MapPut("/api/instances/{id}", async (string id, XOAInstance instance, ConfigService configService) =>
+{
+    if (string.IsNullOrWhiteSpace(instance.Name) || string.IsNullOrWhiteSpace(instance.Url))
+    {
+        return Results.BadRequest(new { error = "Name and Url are required." });
+    }
+
+    var updated = await configService.UpdateInstanceByIdAsync(id, instance);
+    if (!updated)
+    {
+        return Results.NotFound(new { error = "Instance not found." });
+    }
+
+    return Results.Ok(await configService.LoadInstanceSummariesAsync());
+});
+
+// Flips Enabled for an existing instance without requiring the full Add/Update form.
+// If the instance is being disabled, immediately strip it from the live dashboard state
+// so it's excluded from the next background refresh cycle right away.
+app.MapPost("/api/instances/{id}/toggle-enabled", async (string id, ConfigService configService, MonitorEngine engine) =>
+{
+    var newState = await configService.ToggleInstanceEnabledAsync(id);
+    if (newState == null)
+    {
+        return Results.NotFound(new { error = "Instance not found." });
+    }
+
+    if (newState == false)
+    {
+        var instances = await configService.LoadInstancesAsync();
+        var inst = instances.FirstOrDefault(i => i.Id == id);
+        if (inst != null)
+        {
+            await engine.RemoveInstanceAsync(inst.Name);
+        }
+    }
+
+    return Results.Ok(await configService.LoadInstanceSummariesAsync());
+});
+
 app.MapDelete("/api/instances/{name}", async (string name, ConfigService configService, MonitorEngine engine) =>
 {
     await configService.DeleteInstanceAsync(name);
@@ -114,12 +157,16 @@ app.MapGet("/api/history", async (string instance, string vm, ConfigService conf
         return Results.BadRequest(new { error = "No API token configured for this instance." });
     }
 
-    var history = await apiService.GetVmHistoryAsync(inst.Url, inst.ApiToken, vm, ct);
+    var history = await apiService.GetVmHistoryAsync(inst.Url, inst.ApiToken, vm, ct: ct);
     return Results.Ok(history);
 });
 
 app.MapGet("/api/settings", async (ConfigService configService) =>
-    Results.Ok(new { refreshIntervalMinutes = await configService.GetGlobalRefreshIntervalAsync() }));
+    Results.Ok(new
+    {
+        refreshIntervalMinutes = await configService.GetGlobalRefreshIntervalAsync(),
+        maxConcurrentRequests = await configService.GetMaxConcurrentRequestsAsync()
+    }));
 
 app.MapPost("/api/settings", async (SettingsRequest req, ConfigService configService) =>
 {
@@ -128,13 +175,23 @@ app.MapPost("/api/settings", async (SettingsRequest req, ConfigService configSer
         return Results.BadRequest(new { error = "refreshIntervalMinutes must be at least 1." });
     }
 
+    if (req.MaxConcurrentRequests < 1)
+    {
+        return Results.BadRequest(new { error = "maxConcurrentRequests must be at least 1." });
+    }
+
     await configService.SetGlobalRefreshIntervalAsync(req.RefreshIntervalMinutes);
-    return Results.Ok(new { refreshIntervalMinutes = req.RefreshIntervalMinutes });
+    await configService.SetMaxConcurrentRequestsAsync(req.MaxConcurrentRequests);
+    return Results.Ok(new
+    {
+        refreshIntervalMinutes = req.RefreshIntervalMinutes,
+        maxConcurrentRequests = req.MaxConcurrentRequests
+    });
 });
 
 app.MapGet("/api/health", () => Results.Ok(new { status = "ok", time = DateTime.UtcNow }));
 
 app.Run();
 
-record SettingsRequest(int RefreshIntervalMinutes);
+record SettingsRequest(int RefreshIntervalMinutes, int MaxConcurrentRequests);
 record TestConnectionRequest(string Url, string ApiToken);
