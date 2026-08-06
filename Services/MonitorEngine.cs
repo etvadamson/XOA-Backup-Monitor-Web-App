@@ -73,9 +73,10 @@ namespace XOABackupMonitorWeb.Services
         public async Task RefreshAllAsync(CancellationToken ct = default)
         {
             var instances = await _configService.LoadInstancesAsync();
+            var maxConcurrentRequests = await _configService.GetMaxConcurrentRequestsAsync();
 
             var tasks = instances.Where(i => i.IsEnabled)
-                .Select(instance => RefreshSingleInstanceInternalAsync(instance, ct));
+                .Select(instance => RefreshSingleInstanceInternalAsync(instance, maxConcurrentRequests, ct));
 
             var results = await Task.WhenAll(tasks);
 
@@ -108,7 +109,8 @@ namespace XOABackupMonitorWeb.Services
                 return;
             }
 
-            var results = await RefreshSingleInstanceInternalAsync(instance, ct);
+            var maxConcurrentRequests = await _configService.GetMaxConcurrentRequestsAsync();
+            var results = await RefreshSingleInstanceInternalAsync(instance, maxConcurrentRequests, ct);
 
             List<VMBackupStatus> snapshot;
             lock (_stateLock)
@@ -135,7 +137,7 @@ namespace XOABackupMonitorWeb.Services
         }
 
         private async Task<List<VMBackupStatus>> RefreshSingleInstanceInternalAsync(
-            XOAInstance instance, CancellationToken ct)
+            XOAInstance instance, int maxConcurrentRequests, CancellationToken ct)
         {
             if (string.IsNullOrEmpty(instance.ApiToken))
             {
@@ -154,7 +156,7 @@ namespace XOABackupMonitorWeb.Services
 
             try
             {
-                return await _apiService.GetBackupStatusAsync(instance.Url, instance.ApiToken, instance.Name, ct);
+                return await _apiService.GetBackupStatusAsync(instance.Url, instance.ApiToken, instance.Name, maxConcurrentRequests, ct);
             }
             catch (HttpRequestException ex)
             {
