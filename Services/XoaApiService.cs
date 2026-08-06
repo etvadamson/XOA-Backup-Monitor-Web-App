@@ -10,7 +10,11 @@ namespace XOABackupMonitorWeb.Services
     {
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<XoaApiService> _logger;
-        private const int MaxConcurrency = 12;
+
+        // Fallback only, used if a caller doesn't pass an explicit value. The live
+        // value now comes from ConfigService via the "Max Concurrent Requests"
+        // Global Setting and is passed in per-call from MonitorEngine.
+        private const int DefaultMaxConcurrency = 12;
 
         private static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(10);
         private readonly ConcurrentDictionary<string, (DateTime CachedAt, List<XoaVm> Vms, Dictionary<string, string> Hosts)> _vmsHostsCache = new();
@@ -28,14 +32,15 @@ namespace XOABackupMonitorWeb.Services
         }
 
         public async Task<List<VMBackupStatus>> GetBackupStatusAsync(
-            string baseUrl, string apiToken, string instanceName, CancellationToken ct = default)
+            string baseUrl, string apiToken, string instanceName,
+            int maxConcurrency = DefaultMaxConcurrency, CancellationToken ct = default)
         {
             var client = CreateClient(apiToken);
 
             try
             {
-                var (vms, hosts) = await GetVmsAndHostsAsync(client, baseUrl, ct, allowCacheRead: false);
-                var backupLogs = await GetBackupLogsAsync(client, baseUrl, ct, allowCacheRead: false);
+                var (vms, hosts) = await GetVmsAndHostsAsync(client, baseUrl, maxConcurrency, ct, allowCacheRead: false);
+                var backupLogs = await GetBackupLogsAsync(client, baseUrl, maxConcurrency, ct, allowCacheRead: false);
 
                 _logger.LogInformation("[{Instance}] Found {Count} hosts: {Hosts}",
                     instanceName, hosts.Count, string.Join(", ", hosts.Values));
@@ -54,11 +59,12 @@ namespace XOABackupMonitorWeb.Services
         }
 
         public async Task<List<VmHistoryEntry>> GetVmHistoryAsync(
-            string baseUrl, string apiToken, string vmFullName, CancellationToken ct = default)
+            string baseUrl, string apiToken, string vmFullName,
+            int maxConcurrency = DefaultMaxConcurrency, CancellationToken ct = default)
         {
             var client = CreateClient(apiToken);
 
-            var (vms, hosts) = await GetVmsAndHostsAsync(client, baseUrl, ct, allowCacheRead: true);
+            var (vms, hosts) = await GetVmsAndHostsAsync(client, baseUrl, maxConcurrency, ct, allowCacheRead: true);
 
             XoaVm? targetVm = null;
             foreach (var vm in vms)
@@ -75,7 +81,7 @@ namespace XOABackupMonitorWeb.Services
                 return new List<VmHistoryEntry>();
             }
 
-            var backupLogs = await GetBackupLogsAsync(client, baseUrl, ct, allowCacheRead: true);
+            var backupLogs = await GetBackupLogsAsync(client, baseUrl, maxConcurrency, ct, allowCacheRead: true);
             var entries = new List<VmHistoryEntry>();
 
             foreach (var log in backupLogs)
@@ -129,7 +135,7 @@ namespace XOABackupMonitorWeb.Services
         }
 
         private async Task<(List<XoaVm> vms, Dictionary<string, string> hosts)> GetVmsAndHostsAsync(
-            HttpClient client, string baseUrl, CancellationToken ct, bool allowCacheRead)
+            HttpClient client, string baseUrl, int maxConcurrency, CancellationToken ct, bool allowCacheRead)
         {
             if (allowCacheRead &&
                 _vmsHostsCache.TryGetValue(baseUrl, out var cached) &&
@@ -139,7 +145,7 @@ namespace XOABackupMonitorWeb.Services
             }
 
             var vmUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/vms", ct);
-            var vmResults = await MapWithConcurrencyAsync(vmUrls, MaxConcurrency,
+            var vmResults = await MapWithConcurrencyAsync(vmUrls, maxConcurrency,
                 vmUrl => GetJsonAsync<XoaVm>(client, $"{baseUrl}{vmUrl}", ct));
 
             var vms = vmResults
@@ -150,7 +156,7 @@ namespace XOABackupMonitorWeb.Services
                 .ToList();
 
             var hostUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/hosts", ct);
-            var hostResults = await MapWithConcurrencyAsync(hostUrls, MaxConcurrency,
+            var hostResults = await MapWithConcurrencyAsync(hostUrls, maxConcurrency,
                 hostUrl => GetJsonAsync<XoaHost>(client, $"{baseUrl}{hostUrl}", ct));
 
             var hosts = new Dictionary<string, string>();
@@ -167,7 +173,7 @@ namespace XOABackupMonitorWeb.Services
         }
 
         private async Task<List<XoaBackupLog>> GetBackupLogsAsync(
-            HttpClient client, string baseUrl, CancellationToken ct, bool allowCacheRead)
+            HttpClient client, string baseUrl, int maxConcurrency, CancellationToken ct, bool allowCacheRead)
         {
             if (allowCacheRead &&
                 _backupLogsCache.TryGetValue(baseUrl, out var cached) &&
@@ -177,7 +183,7 @@ namespace XOABackupMonitorWeb.Services
             }
 
             var logUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/backup-logs", ct);
-            var logResults = await MapWithConcurrencyAsync(logUrls, MaxConcurrency,
+            var logResults = await MapWithConcurrencyAsync(logUrls, maxConcurrency,
                 logUrl => GetJsonAsync<XoaBackupLog>(client, $"{baseUrl}{logUrl}", ct));
 
             var logs = logResults.Where(l => l != null).Select(l => l!).ToList();
