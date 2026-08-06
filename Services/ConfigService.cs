@@ -13,6 +13,9 @@ namespace XOABackupMonitorWeb.Services
         private readonly ILogger<ConfigService> _logger;
         private readonly SemaphoreSlim _lock = new(1, 1);
 
+        private const int DefaultRefreshIntervalMinutes = 30;
+        private const int DefaultMaxConcurrentRequests = 12;
+
         public ConfigService(IWebHostEnvironment env, ILogger<ConfigService> logger)
         {
             _logger = logger;
@@ -27,6 +30,12 @@ namespace XOABackupMonitorWeb.Services
         public class StoredConfig
         {
             public List<XOAInstance> Instances { get; set; } = new();
+        }
+
+        public class StoredSettings
+        {
+            public int RefreshInterval { get; set; } = DefaultRefreshIntervalMinutes;
+            public int MaxConcurrentRequests { get; set; } = DefaultMaxConcurrentRequests;
         }
 
         public async Task<List<XOAInstance>> LoadInstancesAsync()
@@ -47,6 +56,7 @@ namespace XOABackupMonitorWeb.Services
             var instances = await LoadInstancesAsync();
             return instances.Select(i => new XOAInstanceSummary
             {
+                Id = i.Id,
                 Name = i.Name,
                 Url = i.Url,
                 IsEnabled = i.IsEnabled,
@@ -54,6 +64,11 @@ namespace XOABackupMonitorWeb.Services
             }).ToList();
         }
 
+        /// <summary>
+        /// Adds a new instance, or updates an existing one matched by Name (kept for
+        /// backward compatibility with the plain "create" flow from the Add/Update
+        /// Instance form when no Id is selected). Assigns a new Id if missing.
+        /// </summary>
         public async Task UpsertInstanceAsync(XOAInstance instance)
         {
             await _lock.WaitAsync();
@@ -73,10 +88,77 @@ namespace XOABackupMonitorWeb.Services
                 }
                 else
                 {
+                    if (string.IsNullOrEmpty(instance.Id))
+                    {
+                        instance.Id = Guid.NewGuid().ToString("N");
+                    }
                     config.Instances.Add(instance);
                 }
 
                 SaveInternal(config);
+            }
+            finally
+            {
+                _lock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Updates an existing instance identified by its Id. This is what the
+        /// "click a row to edit, then Save Instance" flow uses so edits (including
+        /// renames) always target the correct record. A blank ApiToken in the
+        /// incoming instance means "keep the existing token".
+        /// </summary>
+        public async Task<bool> UpdateInstanceByIdAsync(string id, XOAInstance instance)
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                var config = LoadInternal();
+                var existing = config.Instances.FirstOrDefault(i => i.Id == id);
+                if (existing == null)
+                {
+                    return false;
+                }
+
+                existing.Name = instance.Name;
+                existing.Url = instance.Url;
+                existing.IsEnabled = instance.IsEnabled;
+                if (!string.IsNullOrEmpty(instance.ApiToken))
+                {
+                    existing.ApiToken = instance.ApiToken;
+                }
+
+                SaveInternal(config);
+                return true;
+            }
+            finally
+            {
+                _lock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Flips IsEnabled for the instance identified by Id and persists it immediately.
+        /// This is the fix for "Enabled toggle doesn't work post-creation" - previously
+        /// the checkbox in the Add/Update form only ever applied at creation time.
+        /// Returns the new IsEnabled value, or null if the instance wasn't found.
+        /// </summary>
+        public async Task<bool?> ToggleInstanceEnabledAsync(string id)
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                var config = LoadInternal();
+                var existing = config.Instances.FirstOrDefault(i => i.Id == id);
+                if (existing == null)
+                {
+                    return null;
+                }
+
+                existing.IsEnabled = !existing.IsEnabled;
+                SaveInternal(config);
+                return existing.IsEnabled;
             }
             finally
             {
@@ -101,27 +183,8 @@ namespace XOABackupMonitorWeb.Services
 
         public async Task<int> GetGlobalRefreshIntervalAsync()
         {
-            await _lock.WaitAsync();
-            try
-            {
-                if (!File.Exists(_settingsFilePath))
-                {
-                    return 30;
-                }
-
-                var json = await File.ReadAllTextAsync(_settingsFilePath);
-                var settings = JsonSerializer.Deserialize<Dictionary<string, int>>(json);
-                return settings != null && settings.TryGetValue("RefreshInterval", out var v) ? v : 30;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to read settings, defaulting to 30 minutes");
-                return 30;
-            }
-            finally
-            {
-                _lock.Release();
-            }
+            var settings = await LoadSettingsInternalAsync();
+            return settings.RefreshInterval;
         }
 
         public async Task SetGlobalRefreshIntervalAsync(int minutes)
@@ -129,14 +192,87 @@ namespace XOABackupMonitorWeb.Services
             await _lock.WaitAsync();
             try
             {
-                var settings = new Dictionary<string, int> { { "RefreshInterval", minutes } };
-                var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
-                await File.WriteAllTextAsync(_settingsFilePath, json);
+                var settings = LoadSettingsInternal();
+                settings.RefreshInterval = minutes;
+                SaveSettingsInternal(settings);
             }
             finally
             {
                 _lock.Release();
             }
+        }
+
+        /// <summary>
+        /// Reads the "Max Concurrent Requests" Global Setting. This is now the live
+        /// source of truth used by MonitorEngine/XoaApiService for how many concurrent
+        /// HTTP requests to fan out per XOA instance, replacing the value that used
+        /// to be hardcoded as a private const in XoaApiService.
+        /// </summary>
+        public async Task<int> GetMaxConcurrentRequestsAsync()
+        {
+            var settings = await LoadSettingsInternalAsync();
+            return settings.MaxConcurrentRequests;
+        }
+
+        public async Task SetMaxConcurrentRequestsAsync(int maxConcurrentRequests)
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                var settings = LoadSettingsInternal();
+                settings.MaxConcurrentRequests = maxConcurrentRequests;
+                SaveSettingsInternal(settings);
+            }
+            finally
+            {
+                _lock.Release();
+            }
+        }
+
+        private async Task<StoredSettings> LoadSettingsInternalAsync()
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                return LoadSettingsInternal();
+            }
+            finally
+            {
+                _lock.Release();
+            }
+        }
+
+        private StoredSettings LoadSettingsInternal()
+        {
+            try
+            {
+                if (!File.Exists(_settingsFilePath))
+                {
+                    return new StoredSettings();
+                }
+
+                var json = File.ReadAllText(_settingsFilePath);
+                var settings = JsonSerializer.Deserialize<StoredSettings>(json);
+                if (settings != null)
+                {
+                    if (settings.RefreshInterval < 1) settings.RefreshInterval = DefaultRefreshIntervalMinutes;
+                    if (settings.MaxConcurrentRequests < 1) settings.MaxConcurrentRequests = DefaultMaxConcurrentRequests;
+                    return settings;
+                }
+
+                return new StoredSettings();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to read settings, using defaults");
+                return new StoredSettings();
+            }
+        }
+
+        private void SaveSettingsInternal(StoredSettings settings)
+        {
+            var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(_settingsFilePath, json);
         }
 
         private StoredConfig LoadInternal()
@@ -150,7 +286,23 @@ namespace XOABackupMonitorWeb.Services
 
                 var encrypted = File.ReadAllBytes(_configFilePath);
                 var json = Decrypt(encrypted);
-                return JsonSerializer.Deserialize<StoredConfig>(json) ?? new StoredConfig();
+                var config = JsonSerializer.Deserialize<StoredConfig>(json) ?? new StoredConfig();
+
+                var dirty = false;
+                foreach (var instance in config.Instances)
+                {
+                    if (string.IsNullOrEmpty(instance.Id))
+                    {
+                        instance.Id = Guid.NewGuid().ToString("N");
+                        dirty = true;
+                    }
+                }
+                if (dirty)
+                {
+                    SaveInternal(config);
+                }
+
+                return config;
             }
             catch (Exception ex)
             {
