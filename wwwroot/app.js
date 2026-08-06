@@ -284,6 +284,7 @@ const testResult = document.getElementById('testResult');
 
 document.getElementById('configureBtn').addEventListener('click', async () => {
   configModal.classList.remove('hidden');
+  resetFormToCreateMode();
   await loadInstances();
   await loadSettings();
 });
@@ -297,28 +298,33 @@ async function loadSettings() {
   const res = await fetch('/api/settings');
   const data = await res.json();
   document.getElementById('refreshIntervalInput').value = data.refreshIntervalMinutes;
+  document.getElementById('maxConcurrentRequestsInput').value = data.maxConcurrentRequests;
 }
 
 document.getElementById('saveIntervalBtn').addEventListener('click', async () => {
   const minutes = parseInt(document.getElementById('refreshIntervalInput').value, 10);
+  const maxConcurrentRequests = parseInt(document.getElementById('maxConcurrentRequestsInput').value, 10);
   await fetch('/api/settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ refreshIntervalMinutes: minutes })
+    body: JSON.stringify({ refreshIntervalMinutes: minutes, maxConcurrentRequests })
   });
 });
 
+let currentInstances = [];
+
 async function loadInstances() {
   const res = await fetch('/api/instances');
-  const instances = await res.json();
+  currentInstances = await res.json();
   instanceTableBody.innerHTML = '';
 
-  for (const inst of instances) {
+  for (const inst of currentInstances) {
     const tr = document.createElement('tr');
+    tr.className = 'instance-row';
     tr.innerHTML = `
-      <td>${escapeHtml(inst.name)}</td>
+      <td><a href="#" class="instance-edit-link" data-id="${escapeHtml(inst.id)}">${escapeHtml(inst.name)}</a></td>
       <td>${escapeHtml(inst.url)}</td>
-      <td>${inst.isEnabled ? 'Yes' : 'No'}</td>
+      <td><button class="toggle-btn ${inst.isEnabled ? 'toggle-yes' : 'toggle-no'}" data-toggle-id="${escapeHtml(inst.id)}">${inst.isEnabled ? 'Yes' : 'No'}</button></td>
       <td>${inst.hasToken ? 'Yes' : 'No'}</td>
       <td><button class="small-btn" data-delete="${escapeHtml(inst.name)}">Delete</button></td>
     `;
@@ -333,10 +339,59 @@ async function loadInstances() {
       await fetchStatus();
     });
   });
+
+  document.querySelectorAll('[data-toggle-id]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const id = e.currentTarget.getAttribute('data-toggle-id');
+      btn.disabled = true;
+      await fetch(`/api/instances/${encodeURIComponent(id)}/toggle-enabled`, { method: 'POST' });
+      await loadInstances();
+      await fetchStatus();
+    });
+  });
+
+  document.querySelectorAll('.instance-edit-link').forEach(link => {
+    link.addEventListener('click', (e) => {
+      e.preventDefault();
+      const id = e.currentTarget.getAttribute('data-id');
+      const inst = currentInstances.find(i => i.id === id);
+      if (inst) populateFormForEdit(inst);
+    });
+  });
 }
+
+function populateFormForEdit(inst) {
+  document.getElementById('instanceId').value = inst.id;
+  document.getElementById('instanceName').value = inst.name;
+  document.getElementById('instanceUrl').value = inst.url;
+  document.getElementById('instanceToken').value = '';
+  document.getElementById('instanceToken').placeholder = inst.hasToken ? 'Leave blank to keep existing' : 'No token set yet';
+  document.getElementById('instanceEnabled').checked = inst.isEnabled;
+  document.getElementById('instanceFormTitle').textContent = `Edit Instance - ${inst.name}`;
+  document.getElementById('saveInstanceBtn').textContent = 'Update Instance';
+  document.getElementById('cancelEditBtn').classList.remove('hidden');
+  testResult.textContent = '';
+}
+
+function resetFormToCreateMode() {
+  document.getElementById('instanceId').value = '';
+  instanceForm.reset();
+  document.getElementById('instanceEnabled').checked = true;
+  document.getElementById('instanceToken').placeholder = 'Leave blank to keep existing';
+  document.getElementById('instanceFormTitle').textContent = 'Add / Update Instance';
+  document.getElementById('saveInstanceBtn').textContent = 'Save Instance';
+  document.getElementById('cancelEditBtn').classList.add('hidden');
+  testResult.textContent = '';
+}
+
+document.getElementById('cancelEditBtn').addEventListener('click', () => {
+  resetFormToCreateMode();
+});
 
 instanceForm.addEventListener('submit', async (e) => {
   e.preventDefault();
+  const id = document.getElementById('instanceId').value;
   const body = {
     name: document.getElementById('instanceName').value,
     url: document.getElementById('instanceUrl').value,
@@ -344,23 +399,31 @@ instanceForm.addEventListener('submit', async (e) => {
     isEnabled: document.getElementById('instanceEnabled').checked
   };
 
-  const saveBtn = e.target.querySelector('button[type="submit"]');
+  const saveBtn = document.getElementById('saveInstanceBtn');
   const originalText = saveBtn ? saveBtn.textContent : '';
   if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving...'; }
 
-  await fetch('/api/instances', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
+  if (id) {
+    await fetch(`/api/instances/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+  } else {
+    await fetch('/api/instances', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+  }
 
-  document.getElementById('instanceToken').value = '';
   await loadInstances();
 
   if (saveBtn) { saveBtn.textContent = 'Refreshing data...'; }
   await fetch(`/api/refresh/${encodeURIComponent(body.name)}`, { method: 'POST' });
   await fetchStatus();
 
+  resetFormToCreateMode();
   if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = originalText; }
 });
 
