@@ -359,3 +359,27 @@ body[data-theme="light"] .sortable-table tbody tr.status-Failed { background: #f
 body[data-theme="light"] .sortable-table tbody tr.status-Warning { background: #fdebd0; color: #7e5109; }
 body[data-theme="light"] .sortable-table tbody tr.status-Error { background: #e8daef; color: #4a235a; }
 .sortable-table td { padding: 8px; }
+
+.instance-edit-link {
+  color: var(--link);
+  text-decoration: none;
+  cursor: pointer;
+  font-weight: 500;
+}
+.instance-edit-link:hover { text-decoration: underline; }
+
+.toggle-btn {
+  border: none;
+  border-radius: 3px;
+  padding: 3px 10px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: bold;
+  color: white;
+  min-width: 40px;
+}
+.toggle-btn.toggle-yes { background: #27ae60; }
+.toggle-btn.toggle-no { background: #7f8c8d; }
+.toggle-btn:disabled { opacity: 0.6; cursor: default; }
+
+#cancelEditBtn { background: #7f8c8d; }
