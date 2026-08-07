@@ -15,6 +15,7 @@ namespace XOABackupMonitorWeb.Services
 
         private const int DefaultRefreshIntervalMinutes = 30;
         private const int DefaultMaxConcurrentRequests = 12;
+        private const int DefaultMaxConcurrentInstanceRefreshes = 5;
 
         public ConfigService(IWebHostEnvironment env, ILogger<ConfigService> logger)
         {
@@ -36,6 +37,14 @@ namespace XOABackupMonitorWeb.Services
         {
             public int RefreshInterval { get; set; } = DefaultRefreshIntervalMinutes;
             public int MaxConcurrentRequests { get; set; } = DefaultMaxConcurrentRequests;
+
+            // Caps how many XOA *instances* are refreshed in parallel during a full
+            // refresh cycle. This is separate from MaxConcurrentRequests, which only
+            // caps the per-instance fan-out of individual VM/host/backup-log calls.
+            // Without this, RefreshAllAsync fires every enabled instance at once,
+            // which at scale (e.g. 100 instances) can burst to hundreds of concurrent
+            // outbound connections for a few seconds every refresh cycle.
+            public int MaxConcurrentInstanceRefreshes { get; set; } = DefaultMaxConcurrentInstanceRefreshes;
         }
 
         public async Task<List<XOAInstance>> LoadInstancesAsync()
@@ -64,11 +73,6 @@ namespace XOABackupMonitorWeb.Services
             }).ToList();
         }
 
-        /// <summary>
-        /// Adds a new instance, or updates an existing one matched by Name (kept for
-        /// backward compatibility with the plain "create" flow from the Add/Update
-        /// Instance form when no Id is selected). Assigns a new Id if missing.
-        /// </summary>
         public async Task UpsertInstanceAsync(XOAInstance instance)
         {
             await _lock.WaitAsync();
@@ -103,12 +107,6 @@ namespace XOABackupMonitorWeb.Services
             }
         }
 
-        /// <summary>
-        /// Updates an existing instance identified by its Id. This is what the
-        /// "click a row to edit, then Save Instance" flow uses so edits (including
-        /// renames) always target the correct record. A blank ApiToken in the
-        /// incoming instance means "keep the existing token".
-        /// </summary>
         public async Task<bool> UpdateInstanceByIdAsync(string id, XOAInstance instance)
         {
             await _lock.WaitAsync();
@@ -138,12 +136,6 @@ namespace XOABackupMonitorWeb.Services
             }
         }
 
-        /// <summary>
-        /// Flips IsEnabled for the instance identified by Id and persists it immediately.
-        /// This is the fix for "Enabled toggle doesn't work post-creation" - previously
-        /// the checkbox in the Add/Update form only ever applied at creation time.
-        /// Returns the new IsEnabled value, or null if the instance wasn't found.
-        /// </summary>
         public async Task<bool?> ToggleInstanceEnabledAsync(string id)
         {
             await _lock.WaitAsync();
@@ -202,12 +194,6 @@ namespace XOABackupMonitorWeb.Services
             }
         }
 
-        /// <summary>
-        /// Reads the "Max Concurrent Requests" Global Setting. This is now the live
-        /// source of truth used by MonitorEngine/XoaApiService for how many concurrent
-        /// HTTP requests to fan out per XOA instance, replacing the value that used
-        /// to be hardcoded as a private const in XoaApiService.
-        /// </summary>
         public async Task<int> GetMaxConcurrentRequestsAsync()
         {
             var settings = await LoadSettingsInternalAsync();
@@ -221,6 +207,33 @@ namespace XOABackupMonitorWeb.Services
             {
                 var settings = LoadSettingsInternal();
                 settings.MaxConcurrentRequests = maxConcurrentRequests;
+                SaveSettingsInternal(settings);
+            }
+            finally
+            {
+                _lock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Reads the "Max Concurrent Instance Refreshes" Global Setting - how many
+        /// XOA instances MonitorEngine.RefreshAllAsync will refresh in parallel during
+        /// a full cycle. Distinct from MaxConcurrentRequests (which caps parallel calls
+        /// *within* a single instance's own data pull).
+        /// </summary>
+        public async Task<int> GetMaxConcurrentInstanceRefreshesAsync()
+        {
+            var settings = await LoadSettingsInternalAsync();
+            return settings.MaxConcurrentInstanceRefreshes;
+        }
+
+        public async Task SetMaxConcurrentInstanceRefreshesAsync(int maxConcurrentInstanceRefreshes)
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                var settings = LoadSettingsInternal();
+                settings.MaxConcurrentInstanceRefreshes = maxConcurrentInstanceRefreshes;
                 SaveSettingsInternal(settings);
             }
             finally
@@ -257,6 +270,7 @@ namespace XOABackupMonitorWeb.Services
                 {
                     if (settings.RefreshInterval < 1) settings.RefreshInterval = DefaultRefreshIntervalMinutes;
                     if (settings.MaxConcurrentRequests < 1) settings.MaxConcurrentRequests = DefaultMaxConcurrentRequests;
+                    if (settings.MaxConcurrentInstanceRefreshes < 1) settings.MaxConcurrentInstanceRefreshes = DefaultMaxConcurrentInstanceRefreshes;
                     return settings;
                 }
 

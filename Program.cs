@@ -69,9 +69,6 @@ app.MapPost("/api/instances", async (XOAInstance instance, ConfigService configS
     return Results.Ok(await configService.LoadInstanceSummariesAsync());
 });
 
-// Updates an existing instance by its stable Id. Used by the "click a row to edit,
-// then Save Instance" flow so edits target the right record instead of matching/creating
-// by Name (which broke if the user also changed the Name field).
 app.MapPut("/api/instances/{id}", async (string id, XOAInstance instance, ConfigService configService) =>
 {
     if (string.IsNullOrWhiteSpace(instance.Name) || string.IsNullOrWhiteSpace(instance.Url))
@@ -88,9 +85,6 @@ app.MapPut("/api/instances/{id}", async (string id, XOAInstance instance, Config
     return Results.Ok(await configService.LoadInstanceSummariesAsync());
 });
 
-// Flips Enabled for an existing instance without requiring the full Add/Update form.
-// If the instance is being disabled, immediately strip it from the live dashboard state
-// so it's excluded from the next background refresh cycle right away.
 app.MapPost("/api/instances/{id}/toggle-enabled", async (string id, ConfigService configService, MonitorEngine engine) =>
 {
     var newState = await configService.ToggleInstanceEnabledAsync(id);
@@ -165,7 +159,8 @@ app.MapGet("/api/settings", async (ConfigService configService) =>
     Results.Ok(new
     {
         refreshIntervalMinutes = await configService.GetGlobalRefreshIntervalAsync(),
-        maxConcurrentRequests = await configService.GetMaxConcurrentRequestsAsync()
+        maxConcurrentRequests = await configService.GetMaxConcurrentRequestsAsync(),
+        maxConcurrentInstanceRefreshes = await configService.GetMaxConcurrentInstanceRefreshesAsync()
     }));
 
 app.MapPost("/api/settings", async (SettingsRequest req, ConfigService configService) =>
@@ -180,12 +175,19 @@ app.MapPost("/api/settings", async (SettingsRequest req, ConfigService configSer
         return Results.BadRequest(new { error = "maxConcurrentRequests must be at least 1." });
     }
 
+    if (req.MaxConcurrentInstanceRefreshes < 1)
+    {
+        return Results.BadRequest(new { error = "maxConcurrentInstanceRefreshes must be at least 1." });
+    }
+
     await configService.SetGlobalRefreshIntervalAsync(req.RefreshIntervalMinutes);
     await configService.SetMaxConcurrentRequestsAsync(req.MaxConcurrentRequests);
+    await configService.SetMaxConcurrentInstanceRefreshesAsync(req.MaxConcurrentInstanceRefreshes);
     return Results.Ok(new
     {
         refreshIntervalMinutes = req.RefreshIntervalMinutes,
-        maxConcurrentRequests = req.MaxConcurrentRequests
+        maxConcurrentRequests = req.MaxConcurrentRequests,
+        maxConcurrentInstanceRefreshes = req.MaxConcurrentInstanceRefreshes
     });
 });
 
@@ -193,5 +195,5 @@ app.MapGet("/api/health", () => Results.Ok(new { status = "ok", time = DateTime.
 
 app.Run();
 
-record SettingsRequest(int RefreshIntervalMinutes, int MaxConcurrentRequests);
+record SettingsRequest(int RefreshIntervalMinutes, int MaxConcurrentRequests, int MaxConcurrentInstanceRefreshes);
 record TestConnectionRequest(string Url, string ApiToken);

@@ -70,13 +70,40 @@ namespace XOABackupMonitorWeb.Services
             }
         }
 
+        /// <summary>
+        /// Refreshes all enabled instances, but throttles how many instances are
+        /// refreshed AT THE SAME TIME via a semaphore sized by
+        /// "Max Concurrent Instance Refreshes". This is intentionally separate from
+        /// MaxConcurrentRequests (which only caps the fan-out of VM/host/backup-log
+        /// calls WITHIN a single instance). Without this gate, every enabled instance
+        /// starts refreshing simultaneously, and at scale (e.g. 100 instances x 12
+        /// concurrent requests each) that can burst to ~1,200 concurrent outbound
+        /// connections for a few seconds every refresh cycle - more likely to stress
+        /// the remote XOA hosts/network than this app itself. With the gate set to,
+        /// say, 4, only 4 instances are actively pulling data at once; the rest queue
+        /// and pick up as slots free.
+        /// </summary>
         public async Task RefreshAllAsync(CancellationToken ct = default)
         {
             var instances = await _configService.LoadInstancesAsync();
             var maxConcurrentRequests = await _configService.GetMaxConcurrentRequestsAsync();
+            var maxConcurrentInstanceRefreshes = await _configService.GetMaxConcurrentInstanceRefreshesAsync();
+
+            using var instanceSemaphore = new SemaphoreSlim(maxConcurrentInstanceRefreshes);
 
             var tasks = instances.Where(i => i.IsEnabled)
-                .Select(instance => RefreshSingleInstanceInternalAsync(instance, maxConcurrentRequests, ct));
+                .Select(async instance =>
+                {
+                    await instanceSemaphore.WaitAsync(ct);
+                    try
+                    {
+                        return await RefreshSingleInstanceInternalAsync(instance, maxConcurrentRequests, ct);
+                    }
+                    finally
+                    {
+                        instanceSemaphore.Release();
+                    }
+                });
 
             var results = await Task.WhenAll(tasks);
 

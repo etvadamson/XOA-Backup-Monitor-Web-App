@@ -299,15 +299,17 @@ async function loadSettings() {
   const data = await res.json();
   document.getElementById('refreshIntervalInput').value = data.refreshIntervalMinutes;
   document.getElementById('maxConcurrentRequestsInput').value = data.maxConcurrentRequests;
+  document.getElementById('maxConcurrentInstanceRefreshesInput').value = data.maxConcurrentInstanceRefreshes;
 }
 
 document.getElementById('saveIntervalBtn').addEventListener('click', async () => {
   const minutes = parseInt(document.getElementById('refreshIntervalInput').value, 10);
   const maxConcurrentRequests = parseInt(document.getElementById('maxConcurrentRequestsInput').value, 10);
+  const maxConcurrentInstanceRefreshes = parseInt(document.getElementById('maxConcurrentInstanceRefreshesInput').value, 10);
   await fetch('/api/settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ refreshIntervalMinutes: minutes, maxConcurrentRequests })
+    body: JSON.stringify({ refreshIntervalMinutes: minutes, maxConcurrentRequests, maxConcurrentInstanceRefreshes })
   });
 });
 
