@@ -13,20 +13,13 @@ namespace XOABackupMonitorWeb.Services
 
         private const int DefaultMaxConcurrency = 12;
 
-        // If a VM's backup task is still "pending"/"running" longer than this, treat
-        // it as stalled/orphaned rather than trusting it's genuinely still in progress.
-        // Real-world trigger: XOA can report a job's overall backup-logs status as
-        // "success" even when one of its VM-level tasks never received a final status
-        // (stuck at "pending", no "end" timestamp) - typically because the underlying
-        // job run was interrupted. Without this cutoff, our dashboard would show that
-        // VM as "IN PROGRESS" indefinitely, with its LastBackupTime silently aging,
-        // and no failed/success entry would ever appear for it again.
         private static readonly TimeSpan StalledTaskThreshold = TimeSpan.FromHours(8);
 
         private static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(10);
         private readonly ConcurrentDictionary<string, (DateTime CachedAt, List<XoaVm> Vms, Dictionary<string, string> Hosts)> _vmsHostsCache = new();
         private readonly ConcurrentDictionary<string, (DateTime CachedAt, List<XoaBackupLog> Logs)> _backupLogsCache = new();
         private readonly ConcurrentDictionary<string, (DateTime CachedAt, List<XoaSchedule> Schedules)> _schedulesCache = new();
+        private readonly ConcurrentDictionary<string, (DateTime CachedAt, Dictionary<string, (long TotalSize, int Count)> ArchivesByVm)> _archivesCache = new();
 
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
@@ -70,7 +63,23 @@ namespace XOABackupMonitorWeb.Services
                     jobSchedules = new Dictionary<string, List<string>>();
                 }
 
-                return GenerateBackupReport(vms, backupLogs, hosts, instanceName, jobSchedules);
+                Dictionary<string, (long TotalSize, int Count)> archivesByVm;
+                try
+                {
+                    archivesByVm = await GetBackupArchivesByVmAsync(client, baseUrl, maxConcurrency, ct, allowCacheRead: false);
+                    _logger.LogInformation(
+                        "[{Instance}] Loaded retained-backup archive data for {VmCount} VM(s)",
+                        instanceName, archivesByVm.Count);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "[{Instance}] Failed to load backup-archives (backup size/count will show as N/A)",
+                        instanceName);
+                    archivesByVm = new Dictionary<string, (long TotalSize, int Count)>();
+                }
+
+                return GenerateBackupReport(vms, backupLogs, hosts, instanceName, jobSchedules, archivesByVm);
             }
             catch (HttpRequestException ex)
             {
@@ -238,6 +247,42 @@ namespace XOABackupMonitorWeb.Services
             return schedules;
         }
 
+        private async Task<Dictionary<string, (long TotalSize, int Count)>> GetBackupArchivesByVmAsync(
+            HttpClient client, string baseUrl, int maxConcurrency, CancellationToken ct, bool allowCacheRead)
+        {
+            if (allowCacheRead &&
+                _archivesCache.TryGetValue(baseUrl, out var cached) &&
+                DateTime.UtcNow - cached.CachedAt < CacheTtl)
+            {
+                return cached.ArchivesByVm;
+            }
+
+            var archiveUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/backup-archives", ct);
+            var archiveResults = await MapWithConcurrencyAsync(archiveUrls, maxConcurrency,
+                archiveUrl => GetJsonAsync<XoaBackupArchive>(client, $"{baseUrl}{archiveUrl}", ct));
+
+            var result = new Dictionary<string, (long TotalSize, int Count)>();
+            foreach (var archive in archiveResults)
+            {
+                if (archive == null) continue;
+
+                var vmId = archive.vm?.uuid;
+                if (string.IsNullOrEmpty(vmId) || archive.size == null) continue;
+
+                if (result.TryGetValue(vmId, out var existing))
+                {
+                    result[vmId] = (existing.TotalSize + archive.size.Value, existing.Count + 1);
+                }
+                else
+                {
+                    result[vmId] = (archive.size.Value, 1);
+                }
+            }
+
+            _archivesCache[baseUrl] = (DateTime.UtcNow, result);
+            return result;
+        }
+
         private static Dictionary<string, List<string>> BuildJobSchedulesMap(List<XoaSchedule> schedules)
         {
             var map = new Dictionary<string, List<string>>();
@@ -357,13 +402,6 @@ namespace XOABackupMonitorWeb.Services
 
             if (vmTask.status == "pending" || vmTask.status == "running")
             {
-                // FIX: previously this branch meant "IN PROGRESS" forever, with no
-                // timeout. If XOA orphans a task (e.g. the parent job gets
-                // interrupted but this specific VM's task never receives a final
-                // status), the dashboard would show it as perpetually "in progress"
-                // while its timestamp silently aged - no failed/success entry would
-                // ever appear again for that VM. Now: if it's been pending/running
-                // longer than StalledTaskThreshold, treat it as stalled instead.
                 if (IsStalledInProgress(vmTask, currentTime, out var stuckFor))
                 {
                     status = BackupStatus.Warning;
@@ -452,7 +490,8 @@ namespace XOABackupMonitorWeb.Services
 
         private List<VMBackupStatus> GenerateBackupReport(
             List<XoaVm> vms, List<XoaBackupLog> backupLogs, Dictionary<string, string> hosts,
-            string instanceName, Dictionary<string, List<string>> jobSchedules)
+            string instanceName, Dictionary<string, List<string>> jobSchedules,
+            Dictionary<string, (long TotalSize, int Count)> archivesByVm)
         {
             var report = new List<VMBackupStatus>();
             var processedVMs = new HashSet<string>();
@@ -466,6 +505,14 @@ namespace XOABackupMonitorWeb.Services
                 processedVMs.Add(vm.uuid ?? "");
 
                 string fullVmName = BuildFullVmName(vm, hosts);
+
+                long? backupSizeBytes = null;
+                int? availableBackupsCount = null;
+                if (!string.IsNullOrEmpty(vm.uuid) && archivesByVm.TryGetValue(vm.uuid, out var archiveInfo))
+                {
+                    backupSizeBytes = archiveInfo.TotalSize;
+                    availableBackupsCount = archiveInfo.Count;
+                }
 
                 var vmBackups = backupLogs
                     .Where(log => log.tasks != null && log.tasks.Count > 0 &&
@@ -493,7 +540,9 @@ namespace XOABackupMonitorWeb.Services
                                 VMName = fullVmName,
                                 LastBackupTime = DateTimeOffset.FromUnixTimeMilliseconds(vmTask.start).LocalDateTime,
                                 Status = status,
-                                Message = $"{statusText} - {messageDetail} ({Math.Round(timeDiff, 1)} hours ago)"
+                                Message = $"{statusText} - {messageDetail} ({Math.Round(timeDiff, 1)} hours ago)",
+                                BackupSizeBytes = backupSizeBytes,
+                                AvailableBackupsCount = availableBackupsCount
                             });
                         }
                     }
@@ -506,7 +555,9 @@ namespace XOABackupMonitorWeb.Services
                         VMName = fullVmName,
                         LastBackupTime = null,
                         Status = BackupStatus.Failed,
-                        Message = "NO BACKUP - Never backed up"
+                        Message = "NO BACKUP - Never backed up",
+                        BackupSizeBytes = backupSizeBytes,
+                        AvailableBackupsCount = availableBackupsCount
                     });
                 }
             }
@@ -738,6 +789,18 @@ namespace XOABackupMonitorWeb.Services
             public string? cron { get; set; }
             public bool enabled { get; set; } = true;
             public string? jobId { get; set; }
+        }
+
+        private class XoaBackupArchive
+        {
+            public long? size { get; set; }
+            public XoaArchiveVm? vm { get; set; }
+        }
+
+        private class XoaArchiveVm
+        {
+            public string? uuid { get; set; }
+            public string? name_label { get; set; }
         }
     }
 }
