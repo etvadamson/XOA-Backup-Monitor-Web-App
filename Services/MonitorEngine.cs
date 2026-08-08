@@ -71,17 +71,24 @@ namespace XOABackupMonitorWeb.Services
         }
 
         /// <summary>
-        /// Refreshes all enabled instances, but throttles how many instances are
-        /// refreshed AT THE SAME TIME via a semaphore sized by
-        /// "Max Concurrent Instance Refreshes". This is intentionally separate from
-        /// MaxConcurrentRequests (which only caps the fan-out of VM/host/backup-log
-        /// calls WITHIN a single instance). Without this gate, every enabled instance
-        /// starts refreshing simultaneously, and at scale (e.g. 100 instances x 12
-        /// concurrent requests each) that can burst to ~1,200 concurrent outbound
-        /// connections for a few seconds every refresh cycle - more likely to stress
-        /// the remote XOA hosts/network than this app itself. With the gate set to,
-        /// say, 4, only 4 instances are actively pulling data at once; the rest queue
-        /// and pick up as slots free.
+        /// Refreshes all enabled instances, throttled by "Max Concurrent Instance
+        /// Refreshes" (see instanceSemaphore below).
+        ///
+        /// IMPORTANT: this used to wholesale-replace _currentBackups with only the
+        /// results from the instance list it captured at the START of this method
+        /// (`_currentBackups = deduplicated;`). That caused a real bug: if a user
+        /// added a brand-new instance WHILE a full refresh cycle was already running
+        /// (e.g. right after a container restart, when RefreshBackgroundService kicks
+        /// off an immediate full-refresh in the background), the new instance would
+        /// briefly appear (its own Add-instance flow triggers an individual refresh),
+        /// then vanish the instant the older, in-flight full-cycle refresh finished and
+        /// overwrote the entire dataset with its stale snapshot - which never knew the
+        /// new instance existed. This looked "random" because it depended purely on
+        /// timing, not on anything about the instance itself (e.g. its name).
+        ///
+        /// Fix: only touch the specific instance names processed in THIS batch. Entries
+        /// for any other instance name (e.g. one added mid-cycle, refreshed via its own
+        /// RefreshInstanceAsync call) are left alone instead of being wiped.
         /// </summary>
         public async Task RefreshAllAsync(CancellationToken ct = default)
         {
@@ -89,9 +96,12 @@ namespace XOABackupMonitorWeb.Services
             var maxConcurrentRequests = await _configService.GetMaxConcurrentRequestsAsync();
             var maxConcurrentInstanceRefreshes = await _configService.GetMaxConcurrentInstanceRefreshesAsync();
 
+            var enabledInstances = instances.Where(i => i.IsEnabled).ToList();
+            var processedInstanceNames = new HashSet<string>(enabledInstances.Select(i => i.Name));
+
             using var instanceSemaphore = new SemaphoreSlim(maxConcurrentInstanceRefreshes);
 
-            var tasks = instances.Where(i => i.IsEnabled)
+            var tasks = enabledInstances
                 .Select(async instance =>
                 {
                     await instanceSemaphore.WaitAsync(ct);
@@ -118,13 +128,19 @@ namespace XOABackupMonitorWeb.Services
                 .Select(g => g.OrderByDescending(b => b.LastBackupTime ?? DateTime.MinValue).First())
                 .ToList();
 
+            List<VMBackupStatus> snapshot;
             lock (_stateLock)
             {
-                _currentBackups = deduplicated;
+                // Only remove/replace entries for instances this cycle actually
+                // covered. Anything else currently in _currentBackups (e.g. an
+                // instance added after this cycle's snapshot was taken) is preserved.
+                _currentBackups.RemoveAll(b => processedInstanceNames.Contains(b.InstanceName));
+                _currentBackups.AddRange(deduplicated);
                 _lastRefresh = DateTime.Now;
+                snapshot = new List<VMBackupStatus>(_currentBackups);
             }
 
-            await _cacheService.SaveCacheAsync(deduplicated);
+            await _cacheService.SaveCacheAsync(snapshot);
         }
 
         public async Task RefreshInstanceAsync(string instanceName, CancellationToken ct = default)
