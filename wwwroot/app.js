@@ -118,6 +118,7 @@ function renderGroupedView(data) {
         : `<span class="name">${escapeHtml(group.instanceName)}</span>`}
       <button class="icon-btn" title="Refresh this instance" data-instance="${escapeHtml(group.instanceName)}">&#128260;</button>
       <span class="spacer"></span>
+      ${group.formattedTotalBackupSize ? `<span class="total-size-chip" title="Total retained backup size across all VMs">${escapeHtml(group.formattedTotalBackupSize)}</span>` : ''}
       <span class="status-chip" style="background:${group.statusColor}">${escapeHtml(group.statusText)}</span>
     `;
     card.appendChild(header);
@@ -135,6 +136,8 @@ function renderGroupedView(data) {
         <span>Status</span>
         <span>Last Backup</span>
         <span>Hours Ago</span>
+        <span>Backup Size</span>
+        <span>Available</span>
         <span>Message</span>
       `;
       card.appendChild(columnHeader);
@@ -147,6 +150,8 @@ function renderGroupedView(data) {
           <span class="status-chip" style="background:${vm.statusColor}">${escapeHtml(vm.statusText)}</span>
           <span>${escapeHtml(vm.formattedLastBackup)}</span>
           <span>${typeof vm.ageInHours === 'number' ? vm.ageInHours.toFixed(1) : ''} hrs</span>
+          <span>${escapeHtml(vm.formattedBackupSize || 'N/A')}</span>
+          <span>${vm.availableBackupsCount != null ? vm.availableBackupsCount : 'N/A'}</span>
           <span>${escapeHtml(vm.message)}</span>
         `;
         card.appendChild(row);
@@ -200,6 +205,7 @@ function renderTableView(data) {
       ${g.instanceUrl
         ? `<a href="${escapeHtml(g.instanceUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(g.instanceName)}</a>`
         : escapeHtml(g.instanceName)}
+      ${g.formattedTotalBackupSize ? `<span class="pill-size">${escapeHtml(g.formattedTotalBackupSize)}</span>` : ''}
       <button class="icon-btn" data-instance="${escapeHtml(g.instanceName)}" title="Refresh">&#128260;</button>
     </span>
   `).join('');
@@ -219,6 +225,9 @@ function renderTableView(data) {
     let bv = b[sortKey];
     if (typeof av === 'string') av = av.toLowerCase();
     if (typeof bv === 'string') bv = bv.toLowerCase();
+    if (av == null && bv == null) return 0;
+    if (av == null) return sortAsc ? -1 : 1;
+    if (bv == null) return sortAsc ? 1 : -1;
     if (av < bv) return sortAsc ? -1 : 1;
     if (av > bv) return sortAsc ? 1 : -1;
     return 0;
@@ -232,6 +241,8 @@ function renderTableView(data) {
       <td>${escapeHtml(vm.statusText)}</td>
       <td>${escapeHtml(vm.formattedLastBackup)}</td>
       <td>${typeof vm.ageInHours === 'number' ? vm.ageInHours.toFixed(1) : ''}</td>
+      <td>${escapeHtml(vm.formattedBackupSize || 'N/A')}</td>
+      <td>${vm.availableBackupsCount != null ? vm.availableBackupsCount : 'N/A'}</td>
       <td>${escapeHtml(vm.message)}</td>
     </tr>
   `).join('');

@@ -136,7 +136,7 @@ body[data-theme="light"] .summary-text { color: #eaf2f8; }
 
 .vm-header {
   display: grid;
-  grid-template-columns: 280px 110px 170px 90px 1fr;
+  grid-template-columns: 260px 100px 150px 80px 100px 90px 1fr;
   gap: 10px;
   padding: 8px 14px;
   background: var(--table-header-bg);
@@ -150,7 +150,7 @@ body[data-theme="light"] .summary-text { color: #eaf2f8; }
 
 .vm-row {
   display: grid;
-  grid-template-columns: 280px 110px 170px 90px 1fr;
+  grid-template-columns: 260px 100px 150px 80px 100px 90px 1fr;
   gap: 10px;
   padding: 10px 14px;
   border-bottom: 1px solid var(--border);
@@ -383,3 +383,21 @@ body[data-theme="light"] .sortable-table tbody tr.status-Error { background: #e8
 .toggle-btn:disabled { opacity: 0.6; cursor: default; }
 
 #cancelEditBtn { background: #7f8c8d; }
+
+.total-size-chip {
+  background: rgba(255,255,255,0.15);
+  color: white;
+  padding: 3px 10px;
+  border-radius: 3px;
+  font-size: 12px;
+  font-weight: bold;
+  white-space: nowrap;
+}
+body[data-theme="light"] .total-size-chip { background: rgba(0,0,0,0.15); }
+
+.pill-size {
+  font-size: 11px;
+  font-weight: normal;
+  opacity: 0.85;
+  margin-left: 2px;
+}
