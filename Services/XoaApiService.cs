@@ -11,14 +11,12 @@ namespace XOABackupMonitorWeb.Services
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<XoaApiService> _logger;
 
-        // Fallback only, used if a caller doesn't pass an explicit value. The live
-        // value now comes from ConfigService via the "Max Concurrent Requests"
-        // Global Setting and is passed in per-call from MonitorEngine.
         private const int DefaultMaxConcurrency = 12;
 
         private static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(10);
         private readonly ConcurrentDictionary<string, (DateTime CachedAt, List<XoaVm> Vms, Dictionary<string, string> Hosts)> _vmsHostsCache = new();
         private readonly ConcurrentDictionary<string, (DateTime CachedAt, List<XoaBackupLog> Logs)> _backupLogsCache = new();
+        private readonly ConcurrentDictionary<string, (DateTime CachedAt, List<XoaSchedule> Schedules)> _schedulesCache = new();
 
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
@@ -45,7 +43,29 @@ namespace XOABackupMonitorWeb.Services
                 _logger.LogInformation("[{Instance}] Found {Count} hosts: {Hosts}",
                     instanceName, hosts.Count, string.Join(", ", hosts.Values));
 
-                return GenerateBackupReport(vms, backupLogs, hosts, instanceName);
+                // Fetch each job's cron schedule(s) so staleness can be evaluated against
+                // what the job is actually scheduled to do, instead of a flat 24-hour rule.
+                // If this fails for any reason, fall back to an empty map - ClassifyTask
+                // then reverts to the flat 24-hour check for every job, so a schedule-fetch
+                // problem degrades gracefully instead of breaking the whole refresh.
+                Dictionary<string, List<string>> jobSchedules;
+                try
+                {
+                    var schedules = await GetSchedulesAsync(client, baseUrl, maxConcurrency, ct, allowCacheRead: false);
+                    jobSchedules = BuildJobSchedulesMap(schedules);
+                    _logger.LogInformation(
+                        "[{Instance}] Loaded {EnabledCount} enabled schedule(s) covering {JobCount} job(s)",
+                        instanceName, schedules.Count(s => s.enabled), jobSchedules.Count);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "[{Instance}] Failed to load backup schedules; falling back to flat 24-hour staleness check",
+                        instanceName);
+                    jobSchedules = new Dictionary<string, List<string>>();
+                }
+
+                return GenerateBackupReport(vms, backupLogs, hosts, instanceName, jobSchedules);
             }
             catch (HttpRequestException ex)
             {
@@ -192,6 +212,52 @@ namespace XOABackupMonitorWeb.Services
             return logs;
         }
 
+        /// <summary>
+        /// Fetches each backup job's schedule(s) - a schedule carries the cron
+        /// expression, the jobId it belongs to, and whether it's currently enabled.
+        /// This is what lets ClassifyTask determine "was this job even supposed to
+        /// run today" instead of assuming every job runs daily.
+        /// </summary>
+        private async Task<List<XoaSchedule>> GetSchedulesAsync(
+            HttpClient client, string baseUrl, int maxConcurrency, CancellationToken ct, bool allowCacheRead)
+        {
+            if (allowCacheRead &&
+                _schedulesCache.TryGetValue(baseUrl, out var cached) &&
+                DateTime.UtcNow - cached.CachedAt < CacheTtl)
+            {
+                return cached.Schedules;
+            }
+
+            var scheduleUrls = await GetJsonArrayAsync(client, $"{baseUrl}/rest/v0/schedules", ct);
+            var scheduleResults = await MapWithConcurrencyAsync(scheduleUrls, maxConcurrency,
+                scheduleUrl => GetJsonAsync<XoaSchedule>(client, $"{baseUrl}{scheduleUrl}", ct));
+
+            var schedules = scheduleResults.Where(s => s != null).Select(s => s!).ToList();
+
+            _schedulesCache[baseUrl] = (DateTime.UtcNow, schedules);
+            return schedules;
+        }
+
+        private static Dictionary<string, List<string>> BuildJobSchedulesMap(List<XoaSchedule> schedules)
+        {
+            var map = new Dictionary<string, List<string>>();
+            foreach (var s in schedules)
+            {
+                if (!s.enabled || string.IsNullOrEmpty(s.jobId) || string.IsNullOrEmpty(s.cron))
+                {
+                    continue;
+                }
+
+                if (!map.TryGetValue(s.jobId, out var list))
+                {
+                    list = new List<string>();
+                    map[s.jobId] = list;
+                }
+                list.Add(s.cron);
+            }
+            return map;
+        }
+
         private static string BuildFullVmName(XoaVm vm, Dictionary<string, string> hosts)
         {
             string hostName = "Unknown-Host";
@@ -242,8 +308,56 @@ namespace XOABackupMonitorWeb.Services
             return false;
         }
 
+        /// <summary>
+        /// Determines whether a completed ("success") backup is stale relative to its
+        /// OWN job schedule, instead of a flat 24-hour rule. This is the fix for jobs
+        /// that intentionally skip certain days (e.g. no fresh backups on Sunday to let
+        /// things coalesce): if the job's cron excludes Sunday, the "most recent expected
+        /// occurrence" on a Monday check correctly resolves to Saturday, not Sunday, so a
+        /// Saturday backup showing as 30+ hours old is NOT flagged as stale. Jobs with a
+        /// different schedule (e.g. ones that DO run Sunday) are evaluated against their
+        /// own cron independently, so this isn't a blanket "skip Sunday" rule - each job
+        /// is judged only against what it is actually configured to do.
+        ///
+        /// Falls back to the flat 24-hour check if no enabled schedule can be resolved
+        /// for the job (unmapped jobId, missing/disabled schedule, cron fetch failure).
+        /// </summary>
+        private static bool IsBackupStaleRelativeToSchedule(
+            string? jobId, Dictionary<string, List<string>> jobSchedules,
+            DateTime lastBackupTime, DateTime currentTime, out DateTime? expectedSince)
+        {
+            expectedSince = null;
+
+            if (!string.IsNullOrEmpty(jobId) && jobSchedules.TryGetValue(jobId, out var crons) && crons.Count > 0)
+            {
+                DateTime? mostRecentExpected = null;
+                foreach (var cron in crons)
+                {
+                    var occurrence = CronScheduleEvaluator.GetLastOccurrenceOnOrBefore(cron, currentTime);
+                    if (occurrence.HasValue && (mostRecentExpected == null || occurrence.Value > mostRecentExpected.Value))
+                    {
+                        mostRecentExpected = occurrence.Value;
+                    }
+                }
+
+                if (mostRecentExpected.HasValue)
+                {
+                    expectedSince = mostRecentExpected;
+                    bool missedExpectedRun = lastBackupTime < mostRecentExpected.Value;
+                    // 2-hour grace window: avoids flagging a job as stale in the few
+                    // minutes/hours right after its scheduled time, before it's had a
+                    // realistic chance to kick off and complete.
+                    bool pastGracePeriod = (currentTime - mostRecentExpected.Value) > TimeSpan.FromHours(2);
+                    return missedExpectedRun && pastGracePeriod;
+                }
+            }
+
+            return (currentTime - lastBackupTime).TotalHours >= 24;
+        }
+
         private static (BackupStatus Status, string StatusText, string MessageDetail, double TimeDiffHours) ClassifyTask(
-            XoaBackupTask vmTask, string? jobName, DateTime currentTime)
+            XoaBackupTask vmTask, string? jobName, string? jobId,
+            Dictionary<string, List<string>> jobSchedules, DateTime currentTime)
         {
             var lastBackupTime = DateTimeOffset.FromUnixTimeMilliseconds(vmTask.start).LocalDateTime;
             var timeDiff = (currentTime - lastBackupTime).TotalHours;
@@ -263,28 +377,35 @@ namespace XOABackupMonitorWeb.Services
                 statusText = "CANCELED";
                 messageDetail = $"{jobName ?? "N/A"} - {(string.IsNullOrWhiteSpace(cancelReason) ? "Job canceled" : cancelReason)}";
             }
-            else if (vmTask.status == "success" && timeDiff < 24)
-            {
-                status = BackupStatus.Success;
-                statusText = "SUCCESS";
-                messageDetail = jobName ?? "N/A";
-            }
             else if (vmTask.status == "failure" || vmTask.status == "interrupted")
             {
                 status = BackupStatus.Failed;
                 statusText = "FAILED";
                 messageDetail = jobName ?? "N/A";
             }
-            else if (timeDiff >= 24)
+            else if (vmTask.status == "success")
             {
-                status = BackupStatus.Warning;
-                statusText = "WARNING";
-                messageDetail = jobName ?? "N/A";
+                bool isStale = IsBackupStaleRelativeToSchedule(jobId, jobSchedules, lastBackupTime, currentTime, out DateTime? expectedSince);
+
+                if (!isStale)
+                {
+                    status = BackupStatus.Success;
+                    statusText = "SUCCESS";
+                    messageDetail = jobName ?? "N/A";
+                }
+                else
+                {
+                    status = BackupStatus.Warning;
+                    statusText = "WARNING";
+                    messageDetail = expectedSince.HasValue
+                        ? $"{jobName ?? "N/A"} - expected by {expectedSince.Value:g} per job schedule"
+                        : jobName ?? "N/A";
+                }
             }
             else
             {
-                status = BackupStatus.Success;
-                statusText = "SUCCESS";
+                status = timeDiff >= 24 ? BackupStatus.Warning : BackupStatus.Success;
+                statusText = timeDiff >= 24 ? "WARNING" : "SUCCESS";
                 messageDetail = jobName ?? "N/A";
             }
 
@@ -319,7 +440,8 @@ namespace XOABackupMonitorWeb.Services
         }
 
         private List<VMBackupStatus> GenerateBackupReport(
-            List<XoaVm> vms, List<XoaBackupLog> backupLogs, Dictionary<string, string> hosts, string instanceName)
+            List<XoaVm> vms, List<XoaBackupLog> backupLogs, Dictionary<string, string> hosts,
+            string instanceName, Dictionary<string, List<string>> jobSchedules)
         {
             var report = new List<VMBackupStatus>();
             var processedVMs = new HashSet<string>();
@@ -352,7 +474,7 @@ namespace XOABackupMonitorWeb.Services
                         if (vmTask != null)
                         {
                             var (status, statusText, messageDetail, timeDiff) =
-                                ClassifyTask(vmTask, latestBackupLog.jobName, currentTime);
+                                ClassifyTask(vmTask, latestBackupLog.jobName, latestBackupLog.jobId, jobSchedules, currentTime);
 
                             report.Add(new VMBackupStatus
                             {
@@ -440,6 +562,135 @@ namespace XOABackupMonitorWeb.Services
             return JsonSerializer.Deserialize<List<string>>(content, JsonOptions) ?? new List<string>();
         }
 
+        /// <summary>
+        /// Minimal standard 5-field cron evaluator (minute hour day-of-month month
+        /// day-of-week). Supports *, single values, comma lists, ranges (a-b), and
+        /// steps (*/n or a-b/n) per field - covers the vast majority of real-world
+        /// backup job schedules without pulling in an external cron library.
+        /// </summary>
+        private static class CronScheduleEvaluator
+        {
+            public static DateTime? GetLastOccurrenceOnOrBefore(
+                string cronExpression, DateTime reference, int maxLookbackDays = 60)
+            {
+                if (string.IsNullOrWhiteSpace(cronExpression))
+                {
+                    return null;
+                }
+
+                var parts = cronExpression.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 5)
+                {
+                    return null;
+                }
+
+                var minuteField = ParseField(parts[0], 0, 59);
+                var hourField = ParseField(parts[1], 0, 23);
+                var domField = ParseField(parts[2], 1, 31);
+                var monthField = ParseField(parts[3], 1, 12);
+                var dowField = ParseField(parts[4], 0, 7); // 0 and 7 both mean Sunday
+
+                if (minuteField == null || hourField == null || domField == null ||
+                    monthField == null || dowField == null)
+                {
+                    return null;
+                }
+
+                for (int dayOffset = 0; dayOffset <= maxLookbackDays; dayOffset++)
+                {
+                    var candidateDate = reference.Date.AddDays(-dayOffset);
+
+                    bool domMatch = domField.Contains(candidateDate.Day);
+                    bool monthMatch = monthField.Contains(candidateDate.Month);
+                    int dow = (int)candidateDate.DayOfWeek; // 0=Sunday..6=Saturday
+                    bool dowMatch = dowField.Contains(dow) || (dow == 0 && dowField.Contains(7));
+
+                    if (!domMatch || !monthMatch || !dowMatch)
+                    {
+                        continue;
+                    }
+
+                    DateTime? best = null;
+                    foreach (var h in hourField)
+                    {
+                        foreach (var m in minuteField)
+                        {
+                            var candidate = candidateDate.AddHours(h).AddMinutes(m);
+                            if (candidate > reference)
+                            {
+                                continue;
+                            }
+                            if (best == null || candidate > best)
+                            {
+                                best = candidate;
+                            }
+                        }
+                    }
+
+                    if (best != null)
+                    {
+                        return best;
+                    }
+                    // No matching time-of-day found on this otherwise-matching day
+                    // (e.g. reference is earlier today than the scheduled time) -
+                    // keep walking further back.
+                }
+
+                return null;
+            }
+
+            private static HashSet<int>? ParseField(string field, int min, int max)
+            {
+                var result = new HashSet<int>();
+                try
+                {
+                    foreach (var token in field.Split(',', StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        string rangeAndStep = token;
+                        int step = 1;
+
+                        if (rangeAndStep.Contains('/'))
+                        {
+                            var stepParts = rangeAndStep.Split('/');
+                            rangeAndStep = stepParts[0];
+                            step = int.Parse(stepParts[1]);
+                        }
+
+                        int rangeStart, rangeEnd;
+                        if (rangeAndStep == "*")
+                        {
+                            rangeStart = min;
+                            rangeEnd = max;
+                        }
+                        else if (rangeAndStep.Contains('-'))
+                        {
+                            var bounds = rangeAndStep.Split('-');
+                            rangeStart = int.Parse(bounds[0]);
+                            rangeEnd = int.Parse(bounds[1]);
+                        }
+                        else
+                        {
+                            rangeStart = rangeEnd = int.Parse(rangeAndStep);
+                        }
+
+                        for (int v = rangeStart; v <= rangeEnd; v += step)
+                        {
+                            if (v >= min && v <= max)
+                            {
+                                result.Add(v);
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    return null;
+                }
+
+                return result.Count > 0 ? result : null;
+            }
+        }
+
         private class XoaVm
         {
             public string? uuid { get; set; }
@@ -459,6 +710,7 @@ namespace XOABackupMonitorWeb.Services
 
         private class XoaBackupLog
         {
+            public string? jobId { get; set; }
             public string? jobName { get; set; }
             public long start { get; set; }
             public List<XoaBackupTask>? tasks { get; set; }
@@ -476,6 +728,14 @@ namespace XOABackupMonitorWeb.Services
         private class XoaTaskData
         {
             public string? id { get; set; }
+        }
+
+        private class XoaSchedule
+        {
+            public string? id { get; set; }
+            public string? cron { get; set; }
+            public bool enabled { get; set; } = true;
+            public string? jobId { get; set; }
         }
     }
 }
