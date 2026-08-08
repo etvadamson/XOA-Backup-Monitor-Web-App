@@ -55,6 +55,8 @@ namespace XOABackupMonitorWeb.Services
                         summary = BuildSummary(g.ToList()),
                         statusText = BuildGroupStatusText(g.ToList()),
                         statusColor = BuildGroupStatusColor(g.ToList()),
+                        totalBackupSizeBytes = SumBackupSizes(g.ToList()),
+                        formattedTotalBackupSize = VMBackupStatus.FormatBytes(SumBackupSizes(g.ToList())),
                         vms = g.OrderBy(v => v.VMName).ToList()
                     })
                     .ToList();
@@ -70,26 +72,6 @@ namespace XOABackupMonitorWeb.Services
             }
         }
 
-        /// <summary>
-        /// Refreshes all enabled instances, throttled by "Max Concurrent Instance
-        /// Refreshes" (see instanceSemaphore below).
-        ///
-        /// IMPORTANT: this used to wholesale-replace _currentBackups with only the
-        /// results from the instance list it captured at the START of this method
-        /// (`_currentBackups = deduplicated;`). That caused a real bug: if a user
-        /// added a brand-new instance WHILE a full refresh cycle was already running
-        /// (e.g. right after a container restart, when RefreshBackgroundService kicks
-        /// off an immediate full-refresh in the background), the new instance would
-        /// briefly appear (its own Add-instance flow triggers an individual refresh),
-        /// then vanish the instant the older, in-flight full-cycle refresh finished and
-        /// overwrote the entire dataset with its stale snapshot - which never knew the
-        /// new instance existed. This looked "random" because it depended purely on
-        /// timing, not on anything about the instance itself (e.g. its name).
-        ///
-        /// Fix: only touch the specific instance names processed in THIS batch. Entries
-        /// for any other instance name (e.g. one added mid-cycle, refreshed via its own
-        /// RefreshInstanceAsync call) are left alone instead of being wiped.
-        /// </summary>
         public async Task RefreshAllAsync(CancellationToken ct = default)
         {
             var instances = await _configService.LoadInstancesAsync();
@@ -131,9 +113,6 @@ namespace XOABackupMonitorWeb.Services
             List<VMBackupStatus> snapshot;
             lock (_stateLock)
             {
-                // Only remove/replace entries for instances this cycle actually
-                // covered. Anything else currently in _currentBackups (e.g. an
-                // instance added after this cycle's snapshot was taken) is preserved.
                 _currentBackups.RemoveAll(b => processedInstanceNames.Contains(b.InstanceName));
                 _currentBackups.AddRange(deduplicated);
                 _lastRefresh = DateTime.Now;
@@ -253,18 +232,25 @@ namespace XOABackupMonitorWeb.Services
             lock (_stateLock)
             {
                 var csv = new StringBuilder();
-                csv.AppendLine("Instance,VMName,Status,LastBackup,HoursAgo,Message");
+                csv.AppendLine("Instance,VMName,Status,LastBackup,HoursAgo,BackupSize,AvailableBackups,Message");
 
                 foreach (var backup in _currentBackups.OrderBy(b => b.InstanceName).ThenBy(b => b.VMName))
                 {
                     csv.AppendLine(
                         $"\"{backup.InstanceName}\",\"{backup.VMName}\"," +
                         $"\"{backup.StatusText}\",\"{backup.FormattedLastBackup}\"," +
-                        $"{backup.AgeInHours:F1},\"{backup.Message}\"");
+                        $"{backup.AgeInHours:F1},\"{backup.FormattedBackupSize}\"," +
+                        $"{backup.AvailableBackupsCount?.ToString() ?? "N/A"},\"{backup.Message}\"");
                 }
 
                 return csv.ToString();
             }
+        }
+
+        private static long? SumBackupSizes(List<VMBackupStatus> vms)
+        {
+            var sizes = vms.Where(v => v.BackupSizeBytes.HasValue).Select(v => v.BackupSizeBytes!.Value).ToList();
+            return sizes.Count > 0 ? sizes.Sum() : null;
         }
 
         private static string BuildSummary(List<VMBackupStatus> backups)
