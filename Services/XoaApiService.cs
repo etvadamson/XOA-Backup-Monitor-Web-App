@@ -13,6 +13,16 @@ namespace XOABackupMonitorWeb.Services
 
         private const int DefaultMaxConcurrency = 12;
 
+        // If a VM's backup task is still "pending"/"running" longer than this, treat
+        // it as stalled/orphaned rather than trusting it's genuinely still in progress.
+        // Real-world trigger: XOA can report a job's overall backup-logs status as
+        // "success" even when one of its VM-level tasks never received a final status
+        // (stuck at "pending", no "end" timestamp) - typically because the underlying
+        // job run was interrupted. Without this cutoff, our dashboard would show that
+        // VM as "IN PROGRESS" indefinitely, with its LastBackupTime silently aging,
+        // and no failed/success entry would ever appear for it again.
+        private static readonly TimeSpan StalledTaskThreshold = TimeSpan.FromHours(8);
+
         private static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(10);
         private readonly ConcurrentDictionary<string, (DateTime CachedAt, List<XoaVm> Vms, Dictionary<string, string> Hosts)> _vmsHostsCache = new();
         private readonly ConcurrentDictionary<string, (DateTime CachedAt, List<XoaBackupLog> Logs)> _backupLogsCache = new();
@@ -43,11 +53,6 @@ namespace XOABackupMonitorWeb.Services
                 _logger.LogInformation("[{Instance}] Found {Count} hosts: {Hosts}",
                     instanceName, hosts.Count, string.Join(", ", hosts.Values));
 
-                // Fetch each job's cron schedule(s) so staleness can be evaluated against
-                // what the job is actually scheduled to do, instead of a flat 24-hour rule.
-                // If this fails for any reason, fall back to an empty map - ClassifyTask
-                // then reverts to the flat 24-hour check for every job, so a schedule-fetch
-                // problem degrades gracefully instead of breaking the whole refresh.
                 Dictionary<string, List<string>> jobSchedules;
                 try
                 {
@@ -103,6 +108,7 @@ namespace XOABackupMonitorWeb.Services
 
             var backupLogs = await GetBackupLogsAsync(client, baseUrl, maxConcurrency, ct, allowCacheRead: true);
             var entries = new List<VmHistoryEntry>();
+            var currentTime = DateTime.Now;
 
             foreach (var log in backupLogs)
             {
@@ -112,7 +118,7 @@ namespace XOABackupMonitorWeb.Services
                     continue;
                 }
 
-                var (status, statusText, messageDetail) = ClassifyHistoricalTask(vmTask, log.jobName);
+                var (status, statusText, messageDetail) = ClassifyHistoricalTask(vmTask, log.jobName, currentTime);
 
                 if (statusText == "IN PROGRESS")
                 {
@@ -212,12 +218,6 @@ namespace XOABackupMonitorWeb.Services
             return logs;
         }
 
-        /// <summary>
-        /// Fetches each backup job's schedule(s) - a schedule carries the cron
-        /// expression, the jobId it belongs to, and whether it's currently enabled.
-        /// This is what lets ClassifyTask determine "was this job even supposed to
-        /// run today" instead of assuming every job runs daily.
-        /// </summary>
         private async Task<List<XoaSchedule>> GetSchedulesAsync(
             HttpClient client, string baseUrl, int maxConcurrency, CancellationToken ct, bool allowCacheRead)
         {
@@ -308,20 +308,13 @@ namespace XOABackupMonitorWeb.Services
             return false;
         }
 
-        /// <summary>
-        /// Determines whether a completed ("success") backup is stale relative to its
-        /// OWN job schedule, instead of a flat 24-hour rule. This is the fix for jobs
-        /// that intentionally skip certain days (e.g. no fresh backups on Sunday to let
-        /// things coalesce): if the job's cron excludes Sunday, the "most recent expected
-        /// occurrence" on a Monday check correctly resolves to Saturday, not Sunday, so a
-        /// Saturday backup showing as 30+ hours old is NOT flagged as stale. Jobs with a
-        /// different schedule (e.g. ones that DO run Sunday) are evaluated against their
-        /// own cron independently, so this isn't a blanket "skip Sunday" rule - each job
-        /// is judged only against what it is actually configured to do.
-        ///
-        /// Falls back to the flat 24-hour check if no enabled schedule can be resolved
-        /// for the job (unmapped jobId, missing/disabled schedule, cron fetch failure).
-        /// </summary>
+        private static bool IsStalledInProgress(XoaBackupTask vmTask, DateTime currentTime, out TimeSpan stuckFor)
+        {
+            var startedAt = DateTimeOffset.FromUnixTimeMilliseconds(vmTask.start).LocalDateTime;
+            stuckFor = currentTime - startedAt;
+            return stuckFor > StalledTaskThreshold;
+        }
+
         private static bool IsBackupStaleRelativeToSchedule(
             string? jobId, Dictionary<string, List<string>> jobSchedules,
             DateTime lastBackupTime, DateTime currentTime, out DateTime? expectedSince)
@@ -344,9 +337,6 @@ namespace XOABackupMonitorWeb.Services
                 {
                     expectedSince = mostRecentExpected;
                     bool missedExpectedRun = lastBackupTime < mostRecentExpected.Value;
-                    // 2-hour grace window: avoids flagging a job as stale in the few
-                    // minutes/hours right after its scheduled time, before it's had a
-                    // realistic chance to kick off and complete.
                     bool pastGracePeriod = (currentTime - mostRecentExpected.Value) > TimeSpan.FromHours(2);
                     return missedExpectedRun && pastGracePeriod;
                 }
@@ -367,9 +357,25 @@ namespace XOABackupMonitorWeb.Services
 
             if (vmTask.status == "pending" || vmTask.status == "running")
             {
-                status = BackupStatus.Warning;
-                statusText = "IN PROGRESS";
-                messageDetail = jobName ?? "N/A";
+                // FIX: previously this branch meant "IN PROGRESS" forever, with no
+                // timeout. If XOA orphans a task (e.g. the parent job gets
+                // interrupted but this specific VM's task never receives a final
+                // status), the dashboard would show it as perpetually "in progress"
+                // while its timestamp silently aged - no failed/success entry would
+                // ever appear again for that VM. Now: if it's been pending/running
+                // longer than StalledTaskThreshold, treat it as stalled instead.
+                if (IsStalledInProgress(vmTask, currentTime, out var stuckFor))
+                {
+                    status = BackupStatus.Warning;
+                    statusText = "STALLED";
+                    messageDetail = $"{jobName ?? "N/A"} - task has been {vmTask.status} for {Math.Round(stuckFor.TotalHours, 1)}h; likely an orphaned/interrupted job - check XOA directly";
+                }
+                else
+                {
+                    status = BackupStatus.Warning;
+                    statusText = "IN PROGRESS";
+                    messageDetail = jobName ?? "N/A";
+                }
             }
             else if (IsCanceled(vmTask, out string cancelReason))
             {
@@ -413,10 +419,15 @@ namespace XOABackupMonitorWeb.Services
         }
 
         private static (BackupStatus Status, string StatusText, string MessageDetail) ClassifyHistoricalTask(
-            XoaBackupTask vmTask, string? jobName)
+            XoaBackupTask vmTask, string? jobName, DateTime currentTime)
         {
             if (vmTask.status == "pending" || vmTask.status == "running")
             {
+                if (IsStalledInProgress(vmTask, currentTime, out var stuckFor))
+                {
+                    return (BackupStatus.Warning, "STALLED",
+                        $"{jobName ?? "N/A"} - task has been {vmTask.status} for {Math.Round(stuckFor.TotalHours, 1)}h");
+                }
                 return (BackupStatus.Warning, "IN PROGRESS", jobName ?? "N/A");
             }
 
@@ -562,12 +573,6 @@ namespace XOABackupMonitorWeb.Services
             return JsonSerializer.Deserialize<List<string>>(content, JsonOptions) ?? new List<string>();
         }
 
-        /// <summary>
-        /// Minimal standard 5-field cron evaluator (minute hour day-of-month month
-        /// day-of-week). Supports *, single values, comma lists, ranges (a-b), and
-        /// steps (*/n or a-b/n) per field - covers the vast majority of real-world
-        /// backup job schedules without pulling in an external cron library.
-        /// </summary>
         private static class CronScheduleEvaluator
         {
             public static DateTime? GetLastOccurrenceOnOrBefore(
@@ -588,7 +593,7 @@ namespace XOABackupMonitorWeb.Services
                 var hourField = ParseField(parts[1], 0, 23);
                 var domField = ParseField(parts[2], 1, 31);
                 var monthField = ParseField(parts[3], 1, 12);
-                var dowField = ParseField(parts[4], 0, 7); // 0 and 7 both mean Sunday
+                var dowField = ParseField(parts[4], 0, 7);
 
                 if (minuteField == null || hourField == null || domField == null ||
                     monthField == null || dowField == null)
@@ -602,7 +607,7 @@ namespace XOABackupMonitorWeb.Services
 
                     bool domMatch = domField.Contains(candidateDate.Day);
                     bool monthMatch = monthField.Contains(candidateDate.Month);
-                    int dow = (int)candidateDate.DayOfWeek; // 0=Sunday..6=Saturday
+                    int dow = (int)candidateDate.DayOfWeek;
                     bool dowMatch = dowField.Contains(dow) || (dow == 0 && dowField.Contains(7));
 
                     if (!domMatch || !monthMatch || !dowMatch)
@@ -631,9 +636,6 @@ namespace XOABackupMonitorWeb.Services
                     {
                         return best;
                     }
-                    // No matching time-of-day found on this otherwise-matching day
-                    // (e.g. reference is earlier today than the scheduled time) -
-                    // keep walking further back.
                 }
 
                 return null;
