@@ -37,13 +37,6 @@ namespace XOABackupMonitorWeb.Services
         {
             public int RefreshInterval { get; set; } = DefaultRefreshIntervalMinutes;
             public int MaxConcurrentRequests { get; set; } = DefaultMaxConcurrentRequests;
-
-            // Caps how many XOA *instances* are refreshed in parallel during a full
-            // refresh cycle. This is separate from MaxConcurrentRequests, which only
-            // caps the per-instance fan-out of individual VM/host/backup-log calls.
-            // Without this, RefreshAllAsync fires every enabled instance at once,
-            // which at scale (e.g. 100 instances) can burst to hundreds of concurrent
-            // outbound connections for a few seconds every refresh cycle.
             public int MaxConcurrentInstanceRefreshes { get; set; } = DefaultMaxConcurrentInstanceRefreshes;
         }
 
@@ -73,33 +66,56 @@ namespace XOABackupMonitorWeb.Services
             }).ToList();
         }
 
-        public async Task UpsertInstanceAsync(XOAInstance instance)
+        /// <summary>
+        /// Result of a create attempt. Success is false with a Reason when the
+        /// instance was NOT created (e.g. a name collision).
+        /// </summary>
+        public record CreateInstanceResult(bool Success, string? Reason = null);
+
+        /// <summary>
+        /// Creates a brand-new instance. This is what POST /api/instances (the
+        /// "blank form, new instance" flow) now uses.
+        ///
+        /// FIX: previously this method (formerly UpsertInstanceAsync) matched an
+        /// "existing" instance purely by Name and MERGED into it - silently
+        /// overwriting that other instance's URL/enabled/token if the name
+        /// happened to collide (including via trailing whitespace from
+        /// copy/paste, which is easy to hit once you have 50-100 instances).
+        /// The visible symptom: "Test Connection" against the NEW url/token
+        /// succeeds (it always tests exactly what's typed), but the dashboard
+        /// later shows "Invalid API token" for that instance - because what
+        /// actually got saved/refreshed was the OTHER, pre-existing instance
+        /// under the same name, with a token that didn't necessarily match.
+        ///
+        /// Now: creation always assigns a fresh Id and REJECTS (returns
+        /// Success=false) if the name is already used by a different instance,
+        /// instead of silently merging into it. Editing an existing instance by
+        /// name is only possible via UpdateInstanceByIdAsync (the click-to-edit
+        /// flow), which is unaffected by this change.
+        /// </summary>
+        public async Task<CreateInstanceResult> CreateInstanceAsync(XOAInstance instance)
         {
             await _lock.WaitAsync();
             try
             {
                 var config = LoadInternal();
-                var existing = config.Instances.FirstOrDefault(i => i.Name == instance.Name);
+                var trimmedName = instance.Name.Trim();
 
-                if (existing != null)
+                var collision = config.Instances.FirstOrDefault(i =>
+                    string.Equals(i.Name.Trim(), trimmedName, StringComparison.OrdinalIgnoreCase));
+
+                if (collision != null)
                 {
-                    existing.Url = instance.Url;
-                    existing.IsEnabled = instance.IsEnabled;
-                    if (!string.IsNullOrEmpty(instance.ApiToken))
-                    {
-                        existing.ApiToken = instance.ApiToken;
-                    }
-                }
-                else
-                {
-                    if (string.IsNullOrEmpty(instance.Id))
-                    {
-                        instance.Id = Guid.NewGuid().ToString("N");
-                    }
-                    config.Instances.Add(instance);
+                    return new CreateInstanceResult(false,
+                        $"An instance named \"{collision.Name}\" already exists. Use a unique name, or click that instance in the list above to edit it instead.");
                 }
 
+                instance.Name = trimmedName;
+                instance.Id = Guid.NewGuid().ToString("N");
+                config.Instances.Add(instance);
                 SaveInternal(config);
+
+                return new CreateInstanceResult(true);
             }
             finally
             {
@@ -119,7 +135,7 @@ namespace XOABackupMonitorWeb.Services
                     return false;
                 }
 
-                existing.Name = instance.Name;
+                existing.Name = instance.Name.Trim();
                 existing.Url = instance.Url;
                 existing.IsEnabled = instance.IsEnabled;
                 if (!string.IsNullOrEmpty(instance.ApiToken))
@@ -215,12 +231,6 @@ namespace XOABackupMonitorWeb.Services
             }
         }
 
-        /// <summary>
-        /// Reads the "Max Concurrent Instance Refreshes" Global Setting - how many
-        /// XOA instances MonitorEngine.RefreshAllAsync will refresh in parallel during
-        /// a full cycle. Distinct from MaxConcurrentRequests (which caps parallel calls
-        /// *within* a single instance's own data pull).
-        /// </summary>
         public async Task<int> GetMaxConcurrentInstanceRefreshesAsync()
         {
             var settings = await LoadSettingsInternalAsync();

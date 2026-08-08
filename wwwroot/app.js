@@ -405,18 +405,27 @@ instanceForm.addEventListener('submit', async (e) => {
   const originalText = saveBtn ? saveBtn.textContent : '';
   if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving...'; }
 
+  let res;
   if (id) {
-    await fetch(`/api/instances/${encodeURIComponent(id)}`, {
+    res = await fetch(`/api/instances/${encodeURIComponent(id)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
   } else {
-    await fetch('/api/instances', {
+    res = await fetch('/api/instances', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
+  }
+
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    testResult.textContent = data.error || 'Failed to save instance.';
+    testResult.style.color = '#e74c3c';
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = originalText; }
+    return;
   }
 
   await loadInstances();

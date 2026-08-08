@@ -58,6 +58,9 @@ app.MapGet("/api/export/csv", (MonitorEngine engine) =>
 app.MapGet("/api/instances", async (ConfigService configService) =>
     Results.Ok(await configService.LoadInstanceSummariesAsync()));
 
+// Creates a brand-new instance only. Rejects (400) if the name already exists,
+// instead of silently merging into that other instance's record (see
+// ConfigService.CreateInstanceAsync for the full rationale/bug history).
 app.MapPost("/api/instances", async (XOAInstance instance, ConfigService configService) =>
 {
     if (string.IsNullOrWhiteSpace(instance.Name) || string.IsNullOrWhiteSpace(instance.Url))
@@ -65,7 +68,12 @@ app.MapPost("/api/instances", async (XOAInstance instance, ConfigService configS
         return Results.BadRequest(new { error = "Name and Url are required." });
     }
 
-    await configService.UpsertInstanceAsync(instance);
+    var result = await configService.CreateInstanceAsync(instance);
+    if (!result.Success)
+    {
+        return Results.BadRequest(new { error = result.Reason });
+    }
+
     return Results.Ok(await configService.LoadInstanceSummariesAsync());
 });
 
